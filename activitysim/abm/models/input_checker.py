@@ -206,7 +206,7 @@ def validate_with_pydantic(
     return v_errors, v_warnings, pydantic_lists
 
 
-def report_errors(state, input_checker_settings, v_warnings, v_errors):
+def report_errors( input_checker_settings, v_warnings, v_errors):
 
     # logging overall statistics first before printing details
     for table_settings in input_checker_settings["table_list"]:
@@ -261,35 +261,7 @@ def report_errors(state, input_checker_settings, v_warnings, v_errors):
                     )
 
                 for error in error_group.schema_errors:
-                    if "dataframe validator" in str(error):
-                        file_logger.error(
-                            "Failed dataframe validator: " + str(error).split("\n")[-1]
-                        )
-                    elif "element-wise validator" in str(error):
-                        if "DataFrameSchema" in str(error):
-                            file_logger.error(
-                                "Failed element-wise validator: <"
-                                + str(error).split("\n")[0].split(" ")[1]
-                                + table_name
-                                + ")>\n\t"
-                                + str(error)
-                                .split("failure cases:\n")[0]
-                                .split("\n")[-2]
-                                + "\n\tfailure cases:\n\t"
-                                + "\n\t".join(
-                                    str(error).split("failure cases:\n")[1].split("\n")
-                                )
-                            )
-                        else:
-                            file_logger.error(
-                                "Failed element-wise validator: <"
-                                + " ".join(str(error).split("\n")[0].split(" ")[1:3])
-                                + "\n\t"
-                                + "\n\t".join(str(error).split("\n")[1:])
-                            )
-                    else:
-                        file_logger.error(str(error))
-                    file_logger.error("\n")
+                    file_logger.error(_format_message(error))
 
         # printing out any warnings
         warns = v_warnings[table_name]
@@ -299,37 +271,7 @@ def report_errors(state, input_checker_settings, v_warnings, v_errors):
             )
 
             for warn in warns:
-                if "dataframe validator" in str(warn.message):
-                    file_logger.warning(
-                        "Failed dataframe validator: "
-                        + str(warn.message).split("\n")[-1]
-                    )
-                elif "element-wise validator" in str(warn.message):
-                    if "DataFrameSchema" in str(warn.message):
-                        file_logger.warning(
-                            "Failed element-wise validator: <"
-                            + str(warn.message).split("\n")[0].split(" ")[1]
-                            + table_name
-                            + ")>\n\t"
-                            + str(warn.message)
-                            .split("failure cases:\n")[0]
-                            .split("\n")[-2]
-                            + "\n\tfailure cases:\n\t"
-                            + "\n\t".join(
-                                str(warn.message)
-                                .split("failure cases:\n")[1]
-                                .split("\n")
-                            )
-                        )
-                    else:
-                        file_logger.warning(
-                            "Failed element-wise validator: <"
-                            + " ".join(str(warn.message).split("\n")[0].split(" ")[1:3])
-                            + "\n\t"
-                            + "\n\t".join(str(warn.message).split("\n")[1:])
-                        )
-                else:
-                    file_logger.warning(warn)
+                file_logger.warning(_format_message(warn))
             file_logger.warning("\n")
 
         infos = _log_infos[table_name]
@@ -347,6 +289,29 @@ def report_errors(state, input_checker_settings, v_warnings, v_errors):
         logger.info("See the input_checker.log for full details on errors and warnings")
 
     return input_check_failure
+
+def _format_message(error):
+    if "dataframe validator" in str(error):
+        return  ' '.join(str(error).split()[1:]) + '\n'
+    elif "element-wise validator" in str(error):
+        if "DataFrameSchema" in str(error):
+            return ' '.join(
+
+                str(error.message).split('failure cases:')[0].split()[1:]
+                
+                ) + _per_line_failures(error) + '\n'
+        else:
+            return str(error.message).split('failure cases:')[0] + _per_line_failures(error) + '\n'
+
+    else:
+        return str(error) + '\n'
+
+def _per_line_failures(warn):
+    return "\n\tfailure cases:\n\t" + "\n\t".join(
+                                str(warn.message)
+                                .split("failure cases:")[1]
+                                .replace(',','').split()
+                            )
 
 
 def log_info(text: str):
@@ -385,7 +350,7 @@ def input_checker(state: workflow.State):
     )
 
     data_model_dir = state.get_injectable("data_model_dir")[0]
-    logger.info("Data model directory:", data_model_dir)
+    logger.info("Data model directory: %s", data_model_dir)
 
     # FIXME: path doesn't recognize windows path object, so converting to string.
     # Is there a better way to get the data model directory than just adding it to the path?
@@ -451,7 +416,7 @@ def input_checker(state: workflow.State):
             )
 
     input_check_failure = report_errors(
-        state, input_checker_settings, v_warnings, v_errors
+         input_checker_settings, v_warnings, v_errors
     )
 
     # free memory from input checker tables
