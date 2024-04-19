@@ -1,0 +1,36 @@
+
+households errors:
+------------------
+Error Counts
+------------
+COLUMN_NOT_IN_DATAFRAME	1
+
+WRONG_DATATYPE	1
+
+DATAFRAME_CHECK	1
+
+column 'bug1' not in dataframe. Columns in dataframe: ['household_id', 'home_zone_id', 'income', 'hhsize']
+
+expected series 'home_zone_id' to have type float64, got int64
+
+'Household' failed series or dataframe validator 0: <Check DF Failure>
+
+
+households warnings:
+--------------------
+Column 'income' failed element-wise validator number 0: greater_than_or_equal_to(100000) 
+	failure cases:
+	10000
+	20000
+	30000
+	40000
+
+Column 'income' failed element-wise validator number 1: less_than(1) 
+	failure cases:
+	10000
+	20000
+	30000
+	40000
+
+
+
