@@ -8,19 +8,21 @@ import pytest, logging, os, pathlib
 import pandera as pa
 
 from activitysim.abm.models.input_checker import (
-    validate_with_pandera, 
+    validate_with_pandera,
     report_errors,
     TABLE_STORE,
     _log_infos,
     file_logger,
-    logger
+    logger,
 )
+
 
 @pytest.fixture(scope="class")
 def v_errors():
     v_errors = {}
     v_errors["households"] = []
     return v_errors
+
 
 @pytest.fixture(scope="class")
 def v_warnings():
@@ -57,7 +59,6 @@ TABLE_STORE["households"] = pd.DataFrame(
 
 
 def test_passing_dataframe(households, v_errors, v_warnings, validation_settings):
-
     TABLE_STORE["households"] = households
 
     class input_checker:
@@ -84,7 +85,6 @@ def test_passing_dataframe(households, v_errors, v_warnings, validation_settings
 
 
 def test_error_dataframe(households, v_errors, v_warnings, validation_settings):
-
     TABLE_STORE["households"] = households
 
     class input_checker:
@@ -108,7 +108,6 @@ def test_error_dataframe(households, v_errors, v_warnings, validation_settings):
 
 
 def test_warning_dataframe(households, v_errors, v_warnings, validation_settings):
-
     TABLE_STORE["households"] = households
 
     class input_checker:
@@ -133,7 +132,6 @@ def test_warning_dataframe(households, v_errors, v_warnings, validation_settings
 def test_custom_check_failure_dataframe(
     households, v_errors, v_warnings, validation_settings
 ):
-
     TABLE_STORE["households"] = households
 
     class input_checker:
@@ -158,46 +156,40 @@ def test_custom_check_failure_dataframe(
         len(returned_warnings["households"]) == 0
     ), f"Expect no household warnings, but got {returned_warnings['households']}"
 
-def test_report_errors(
-    households, v_errors, v_warnings, validation_settings, tmp_path
-    ):
+
+def test_report_errors(households, v_errors, v_warnings, validation_settings, tmp_path):
     TABLE_STORE["households"] = households
-    _log_infos['households'] = list()
+    _log_infos["households"] = list()
 
     class input_checker:
         class Household(pa.DataFrameModel):
             household_id: int = pa.Field(unique=True, gt=0)
             home_zone_id: float = pa.Field(ge=0)
             hhsize: int = pa.Field(gt=0)
-            income: int = pa.Field(ge=100000, lt=1,raise_warning=True)  # warning here
+            income: int = pa.Field(ge=100000, lt=1, raise_warning=True)  # warning here
             bug1: str
 
-            @pa.dataframe_check(name='DF Failure')
-            def test_failure(cls,_: pd.DataFrame):
+            @pa.dataframe_check(name="DF Failure")
+            def test_failure(cls, _: pd.DataFrame):
                 return False
-        
+
         # file_logger = logging.getLogger('input_checker_test')
         file_logger.propagate = False
         logger.propagate = False
-        file_logger.addHandler(logging.FileHandler(tmp_path/'input_checker.log'))
+        file_logger.addHandler(logging.FileHandler(tmp_path / "input_checker.log"))
 
     data_dir = pathlib.Path(__file__).parent / "data"
-    with open(data_dir / 'input_checker.log.artifact') as af:
+    with open(data_dir / "input_checker.log.artifact") as af:
         artifact = af.read()
-
 
     validate_with_pandera(
         input_checker, "households", validation_settings, v_errors, v_warnings
     )
 
-    report_errors(
-        {'table_list':[{'name':'households'}]},
-                  v_warnings,
-                  v_errors)
-    
+    report_errors({"table_list": [{"name": "households"}]}, v_warnings, v_errors)
+
     # check error log for accuracy
-    with open(tmp_path / 'input_checker.log') as rf:
+    with open(tmp_path / "input_checker.log") as rf:
         result = rf.read()
-    
-    assert result == artifact, 'Log file does not match artifact'
-    
+
+    assert result == artifact, "Log file does not match artifact"

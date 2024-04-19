@@ -206,8 +206,7 @@ def validate_with_pydantic(
     return v_errors, v_warnings, pydantic_lists
 
 
-def report_errors( input_checker_settings, v_warnings, v_errors):
-
+def report_errors(input_checker_settings, v_warnings, v_errors):
     # logging overall statistics first before printing details
     for table_settings in input_checker_settings["table_list"]:
         table_name = table_settings["name"]
@@ -290,28 +289,32 @@ def report_errors( input_checker_settings, v_warnings, v_errors):
 
     return input_check_failure
 
+
 def _format_message(error):
     if "dataframe validator" in str(error):
-        return  ' '.join(str(error).split()[1:]) + '\n'
+        return " ".join(str(error).split()[1:]) + "\n"
     elif "element-wise validator" in str(error):
         if "DataFrameSchema" in str(error):
-            return ' '.join(
-
-                str(error.message).split('failure cases:')[0].split()[1:]
-                
-                ) + _per_line_failures(error) + '\n'
+            return (
+                " ".join(str(error.message).split("failure cases:")[0].split()[1:])
+                + _per_line_failures(error)
+                + "\n"
+            )
         else:
-            return str(error.message).split('failure cases:')[0] + _per_line_failures(error) + '\n'
+            return (
+                str(error.message).split("failure cases:")[0]
+                + _per_line_failures(error)
+                + "\n"
+            )
 
     else:
-        return str(error) + '\n'
+        return str(error) + "\n"
+
 
 def _per_line_failures(warn):
     return "\n\tfailure cases:\n\t" + "\n\t".join(
-                                str(warn.message)
-                                .split("failure cases:")[1]
-                                .replace(',','').split()
-                            )
+        str(warn.message).split("failure cases:")[1].replace(",", "").split()
+    )
 
 
 def log_info(text: str):
@@ -415,9 +418,7 @@ def input_checker(state: workflow.State):
                 pydantic_lists,
             )
 
-    input_check_failure = report_errors(
-         input_checker_settings, v_warnings, v_errors
-    )
+    input_check_failure = report_errors(input_checker_settings, v_warnings, v_errors)
 
     # free memory from input checker tables
     for key, value in TABLE_STORE.items():
