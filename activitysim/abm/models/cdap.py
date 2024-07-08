@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -15,9 +17,30 @@ from activitysim.core import (
     tracing,
     workflow,
 )
+from activitysim.core.configuration.base import (
+    ComputeSettings,
+    PreprocessorSettings,
+    PydanticReadable,
+)
 from activitysim.core.util import reindex
 
 logger = logging.getLogger(__name__)
+
+
+class CdapSettings(PydanticReadable, extra="forbid"):
+    PERSON_TYPE_MAP: dict[str, list[int]]
+    INDIV_AND_HHSIZE1_SPEC: str
+    INTERACTION_COEFFICIENTS: str = "cdap_interaction_coefficients.csv"
+    FIXED_RELATIVE_PROPORTIONS_SPEC: str = "cdap_fixed_relative_proportions.csv"
+    ADD_JOINT_TOUR_UTILITY: bool = False
+    JOINT_TOUR_COEFFICIENTS: str = "cdap_joint_tour_coefficients.csv"
+    JOINT_TOUR_USEFUL_COLUMNS: list[str] | None = None
+    """Columns to include from the persons table that will be need to calculate household joint tour utility."""
+    annotate_persons: PreprocessorSettings | None = None
+    annotate_households: PreprocessorSettings | None = None
+    COEFFICIENTS: Path
+    CONSTANTS: dict[str, Any] = {}
+    compute_settings: ComputeSettings | None = None
 
 
 @workflow.step
@@ -26,6 +49,9 @@ def cdap_simulate(
     persons_merged: pd.DataFrame,
     persons: pd.DataFrame,
     households: pd.DataFrame,
+    model_settings: CdapSettings | None = None,
+    model_settings_file_name: str = "cdap.yaml",
+    trace_label: str = "cdap",
 ) -> None:
     """
     CDAP stands for Coordinated Daily Activity Pattern, which is a choice of
@@ -36,18 +62,16 @@ def cdap_simulate(
     routines in the cdap directory of activitysim for this purpose.  This module
     simply applies those utilities using the simulation framework.
     """
-
-    trace_label = "cdap"
-    model_settings = state.filesystem.read_model_settings("cdap.yaml")
+    if model_settings is None:
+        model_settings = CdapSettings.read_settings_file(
+            state.filesystem, model_settings_file_name
+        )
     trace_hh_id = state.settings.trace_hh_id
-    person_type_map = model_settings.get("PERSON_TYPE_MAP", None)
-    assert (
-        person_type_map is not None
-    ), "Expected to find PERSON_TYPE_MAP setting in cdap.yaml"
+    person_type_map = model_settings.PERSON_TYPE_MAP
     estimator = estimation.manager.begin_estimation(state, "cdap")
 
     cdap_indiv_spec = state.filesystem.read_model_spec(
-        file_name=model_settings["INDIV_AND_HHSIZE1_SPEC"]
+        file_name=model_settings.INDIV_AND_HHSIZE1_SPEC
     )
 
     coefficients_df = state.filesystem.read_model_coefficients(model_settings)
@@ -56,9 +80,7 @@ def cdap_simulate(
     )
 
     # Rules and coefficients for generating interaction specs for different household sizes
-    interaction_coefficients_file_name = model_settings.get(
-        "INTERACTION_COEFFICIENTS", "cdap_interaction_coefficients.csv"
-    )
+    interaction_coefficients_file_name = model_settings.INTERACTION_COEFFICIENTS
     cdap_interaction_coefficients = pd.read_csv(
         state.filesystem.get_config_file_path(interaction_coefficients_file_name),
         comment="#",
@@ -90,16 +112,14 @@ def cdap_simulate(
     (i.e. values are not exponentiated before being normalized to probabilities summing to 1.0)
     """
     cdap_fixed_relative_proportions = state.filesystem.read_model_spec(
-        file_name=model_settings["FIXED_RELATIVE_PROPORTIONS_SPEC"]
+        file_name=model_settings.FIXED_RELATIVE_PROPORTIONS_SPEC
     )
 
-    add_joint_tour_utility = model_settings.get("ADD_JOINT_TOUR_UTILITY", False)
+    add_joint_tour_utility = model_settings.ADD_JOINT_TOUR_UTILITY
 
     if add_joint_tour_utility:
         # Rules and coefficients for generating cdap joint tour specs for different household sizes
-        joint_tour_coefficients_file_name = model_settings.get(
-            "JOINT_TOUR_COEFFICIENTS", "cdap_joint_tour_coefficients.csv"
-        )
+        joint_tour_coefficients_file_name = model_settings.JOINT_TOUR_COEFFICIENTS
         cdap_joint_tour_coefficients = pd.read_csv(
             state.filesystem.get_config_file_path(joint_tour_coefficients_file_name),
             comment="#",
@@ -168,6 +188,11 @@ def cdap_simulate(
         for hhsize in range(2, cdap.MAX_HHSIZE + 1):
             spec = cdap.get_cached_spec(state, hhsize)
             estimator.write_table(spec, "spec_%s" % hhsize, append=False)
+            if add_joint_tour_utility:
+                joint_spec = cdap.get_cached_joint_spec(hhsize)
+                estimator.write_table(
+                    joint_spec, "joint_spec_%s" % hhsize, append=False
+                )
 
     logger.info("Running cdap_simulate with %d persons", len(persons_merged.index))
 
@@ -184,6 +209,7 @@ def cdap_simulate(
             trace_hh_id=trace_hh_id,
             trace_label=trace_label,
             add_joint_tour_utility=add_joint_tour_utility,
+            compute_settings=model_settings.compute_settings,
         )
     else:
         choices = cdap.run_cdap(
@@ -197,21 +223,29 @@ def cdap_simulate(
             chunk_size=state.settings.chunk_size,
             trace_hh_id=trace_hh_id,
             trace_label=trace_label,
+            compute_settings=model_settings.compute_settings,
         )
 
     if estimator:
         estimator.write_choices(choices)
         choices = estimator.get_survey_values(choices, "persons", "cdap_activity")
+        if add_joint_tour_utility:
+            hh_joint.index.name = "household_id"
+            hh_joint = estimator.get_survey_values(
+                hh_joint, "households", "has_joint_tour"
+            )
         estimator.write_override_choices(choices)
         estimator.end_estimation()
 
     choices = choices.reindex(persons.index)
+    cap_cat_type = pd.api.types.CategoricalDtype(["", "M", "N", "H"], ordered=False)
+    choices = choices.astype(cap_cat_type)
     persons["cdap_activity"] = choices
 
     expressions.assign_columns(
         state,
         df=persons,
-        model_settings=model_settings.get("annotate_persons"),
+        model_settings=model_settings.annotate_persons,
         trace_label=tracing.extend_trace_label(trace_label, "annotate_persons"),
     )
 
@@ -225,7 +259,7 @@ def cdap_simulate(
     expressions.assign_columns(
         state,
         df=households,
-        model_settings=model_settings.get("annotate_households"),
+        model_settings=model_settings.annotate_households,
         trace_label=tracing.extend_trace_label(trace_label, "annotate_households"),
     )
     state.add_table("households", households)

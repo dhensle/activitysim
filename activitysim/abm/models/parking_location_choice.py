@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -16,16 +17,18 @@ from activitysim.core import (
     tracing,
     workflow,
 )
+from activitysim.core.configuration.base import PreprocessorSettings
+from activitysim.core.configuration.logit import LogitComponentSettings
 from activitysim.core.interaction_sample_simulate import interaction_sample_simulate
 from activitysim.core.tracing import print_elapsed_time
-from activitysim.core.util import assign_in_place
+from activitysim.core.util import assign_in_place, drop_unused_columns
 
 logger = logging.getLogger(__name__)
 
 NO_DESTINATION = -1
 
 
-def wrap_skims(state: workflow.State, model_settings):
+def wrap_skims(state: workflow.State, model_settings: ParkingLocationSettings):
     """
     wrap skims of trip destination using origin, dest column names from model settings.
     Various of these are used by destination_sample, compute_logsums, and destination_simulate
@@ -53,10 +56,10 @@ def wrap_skims(state: workflow.State, model_settings):
     network_los = state.get_injectable("network_los")
     skim_dict = network_los.get_default_skim_dict()
 
-    origin = model_settings["TRIP_ORIGIN"]
-    park_zone = model_settings["ALT_DEST_COL_NAME"]
-    destination = model_settings["TRIP_DESTINATION"]
-    time_period = model_settings["TRIP_DEPARTURE_PERIOD"]
+    origin = model_settings.TRIP_ORIGIN
+    park_zone = model_settings.ALT_DEST_COL_NAME
+    destination = model_settings.TRIP_DESTINATION
+    time_period = model_settings.TRIP_DEPARTURE_PERIOD
 
     skims = {
         "odt_skims": skim_dict.wrap_3d(
@@ -80,8 +83,12 @@ def wrap_skims(state: workflow.State, model_settings):
     return skims
 
 
-def get_spec_for_segment(state: workflow.State, model_settings, spec_name, segment):
-    omnibus_spec = state.filesystem.read_model_spec(file_name=model_settings[spec_name])
+def get_spec_for_segment(
+    state: workflow.State, model_settings: ParkingLocationSettings, segment: str
+):
+    omnibus_spec = state.filesystem.read_model_spec(
+        file_name=model_settings.SPECIFICATION
+    )
 
     spec = omnibus_spec[[segment]]
 
@@ -97,8 +104,9 @@ def parking_destination_simulate(
     segment_name,
     trips,
     destination_sample,
-    model_settings,
+    model_settings: ParkingLocationSettings,
     skims,
+    locals_dict,
     chunk_size,
     trace_hh_id,
     trace_label,
@@ -116,19 +124,14 @@ def parking_destination_simulate(
         trace_label, "parking_destination_simulate"
     )
 
-    spec = get_spec_for_segment(state, model_settings, "SPECIFICATION", segment_name)
+    spec = get_spec_for_segment(state, model_settings, segment_name)
 
     coefficients_df = state.filesystem.read_model_coefficients(model_settings)
     spec = simulate.eval_coefficients(state, spec, coefficients_df, None)
 
-    alt_dest_col_name = model_settings["ALT_DEST_COL_NAME"]
+    alt_dest_col_name = model_settings.ALT_DEST_COL_NAME
 
     logger.info("Running parking_destination_simulate with %d trips", len(trips))
-
-    locals_dict = config.get_model_constants(model_settings).copy()
-    locals_dict.update(skims)
-    locals_dict["timeframe"] = "trip"
-    locals_dict["PARKING"] = skims["op_skims"].dest_key
 
     parking_locations = interaction_sample_simulate(
         state,
@@ -144,6 +147,7 @@ def parking_destination_simulate(
         chunk_size=chunk_size,
         trace_label=trace_label,
         trace_choice_name="parking_loc",
+        explicit_chunk_size=model_settings.explicit_chunk,
     )
 
     # drop any failed zero_prob destinations
@@ -162,7 +166,7 @@ def choose_parking_location(
     segment_name,
     trips,
     alternatives,
-    model_settings,
+    model_settings: ParkingLocationSettings,
     want_sample_table,
     skims,
     chunk_size,
@@ -173,7 +177,31 @@ def choose_parking_location(
 
     t0 = print_elapsed_time()
 
-    alt_dest_col_name = model_settings["ALT_DEST_COL_NAME"]
+    alt_dest_col_name = model_settings.ALT_DEST_COL_NAME
+
+    # remove trips and alts columns that are not used in spec
+    locals_dict = state.get_global_constants()
+    locals_dict.update(config.get_model_constants(model_settings))
+    locals_dict.update(skims)
+    locals_dict["timeframe"] = "trip"
+    locals_dict["PARKING"] = skims["op_skims"].dest_key
+
+    spec = get_spec_for_segment(state, model_settings, segment_name)
+    trips = drop_unused_columns(
+        trips,
+        spec,
+        locals_dict,
+        custom_chooser=None,
+        additional_columns=model_settings.compute_settings.protect_columns,
+    )
+    alternatives = drop_unused_columns(
+        alternatives,
+        spec,
+        locals_dict,
+        custom_chooser=None,
+        additional_columns=model_settings.compute_settings.protect_columns,
+    )
+
     destination_sample = logit.interaction_dataset(
         state, trips, alternatives, alt_index_id=alt_dest_col_name
     )
@@ -187,6 +215,7 @@ def choose_parking_location(
         destination_sample=destination_sample,
         model_settings=model_settings,
         skims=skims,
+        locals_dict=locals_dict,
         chunk_size=chunk_size,
         trace_hh_id=trace_hh_id,
         trace_label=trace_label,
@@ -195,7 +224,7 @@ def choose_parking_location(
     if want_sample_table:
         # FIXME - sample_table
         destination_sample.set_index(
-            model_settings["ALT_DEST_COL_NAME"], append=True, inplace=True
+            model_settings.ALT_DEST_COL_NAME, append=True, inplace=True
         )
     else:
         destination_sample = None
@@ -207,7 +236,7 @@ def choose_parking_location(
 
 def run_parking_destination(
     state: workflow.State,
-    model_settings,
+    model_settings: ParkingLocationSettings,
     trips,
     land_use,
     chunk_size,
@@ -215,11 +244,11 @@ def run_parking_destination(
     trace_label,
     fail_some_trips_for_testing=False,
 ):
-    chooser_filter_column = model_settings.get("CHOOSER_FILTER_COLUMN_NAME")
-    chooser_segment_column = model_settings.get("CHOOSER_SEGMENT_COLUMN_NAME")
+    chooser_filter_column = model_settings.CHOOSER_FILTER_COLUMN_NAME
+    chooser_segment_column = model_settings.CHOOSER_SEGMENT_COLUMN_NAME
 
-    parking_location_column_name = model_settings["ALT_DEST_COL_NAME"]
-    sample_table_name = model_settings.get("DEST_CHOICE_SAMPLE_TABLE_NAME")
+    parking_location_column_name = model_settings.ALT_DEST_COL_NAME
+    sample_table_name = model_settings.DEST_CHOICE_SAMPLE_TABLE_NAME
     want_sample_table = (
         state.settings.want_dest_choice_sample_tables and sample_table_name is not None
     )
@@ -232,7 +261,7 @@ def run_parking_destination(
 
     skims = wrap_skims(state, model_settings)
 
-    alt_column_filter_name = model_settings.get("ALTERNATIVE_FILTER_COLUMN_NAME")
+    alt_column_filter_name = model_settings.ALTERNATIVE_FILTER_COLUMN_NAME
     alternatives = land_use[land_use[alt_column_filter_name]]
     alternatives.index.name = parking_location_column_name
 
@@ -269,7 +298,12 @@ def run_parking_destination(
         if fail_some_trips_for_testing:
             parking_df = parking_df.drop(parking_df.index[0])
 
-        assign_in_place(trips, parking_df.to_frame(parking_location_column_name))
+        assign_in_place(
+            trips,
+            parking_df.to_frame(parking_location_column_name),
+            state.settings.downcast_int,
+            state.settings.downcast_float,
+        )
         trips[parking_location_column_name] = trips[
             parking_location_column_name
         ].fillna(-1)
@@ -281,6 +315,54 @@ def run_parking_destination(
     return trips[parking_location_column_name], save_sample_df
 
 
+class ParkingLocationSettings(LogitComponentSettings, extra="forbid"):
+    """
+    Settings for the `parking_location` component.
+    """
+
+    SPECIFICATION: Path | None = None
+    SPEC: None = None
+    """The school escort model does not use this setting, see `SPECIFICATION`."""
+
+    PREPROCESSOR: PreprocessorSettings | None = None
+    """Setting for the preprocessor."""
+
+    ALT_DEST_COL_NAME: str = "parking_zone"
+    """Parking destination column name."""
+
+    TRIP_DEPARTURE_PERIOD: str = "stop_period"
+    """Trip departure time period."""
+
+    PARKING_LOCATION_SAMPLE_TABLE_NAME: str | None = None
+
+    TRIP_ORIGIN: str = "origin"
+    TRIP_DESTINATION: str = "destination"
+
+    CHOOSER_FILTER_COLUMN_NAME: str
+    """A boolean column to filter choosers.
+
+    If this column evaluates as True the row will be kept.
+    """
+
+    CHOOSER_SEGMENT_COLUMN_NAME: str
+
+    DEST_CHOICE_SAMPLE_TABLE_NAME: str | None = None
+
+    ALTERNATIVE_FILTER_COLUMN_NAME: str
+
+    SEGMENTS: list[str] | None = None
+
+    AUTO_MODES: list[str]
+    """List of auto modes that use parking. AUTO_MODES are used in write_trip_matrices to make sure
+    parking locations are accurately represented in the output trip matrices."""
+
+    explicit_chunk: float = 0
+    """
+    If > 0, use this chunk size instead of adaptive chunking.
+    If less than 1, use this fraction of the total number of rows.
+    """
+
+
 @workflow.step
 def parking_location(
     state: workflow.State,
@@ -288,29 +370,34 @@ def parking_location(
     trips_merged: pd.DataFrame,
     land_use: pd.DataFrame,
     network_los: los.Network_LOS,
+    model_settings: ParkingLocationSettings | None = None,
+    model_settings_file_name: str = "parking_location_choice.yaml",
+    trace_label: str = "parking_location",
 ) -> None:
     """
     Given a set of trips, each trip needs to have a parking location if
     it is eligible for remote parking.
     """
 
-    trace_label = "parking_location"
-    model_settings = state.filesystem.read_model_settings(
-        "parking_location_choice.yaml"
-    )
-    trace_hh_id = state.settings.trace_hh_id
-    alt_destination_col_name = model_settings["ALT_DEST_COL_NAME"]
+    if model_settings is None:
+        model_settings = ParkingLocationSettings.read_settings_file(
+            state.filesystem,
+            model_settings_file_name,
+        )
 
-    preprocessor_settings = model_settings.get("PREPROCESSOR", None)
+    trace_hh_id = state.settings.trace_hh_id
+    alt_destination_col_name = model_settings.ALT_DEST_COL_NAME
+
+    preprocessor_settings = model_settings.PREPROCESSOR
 
     trips_df = trips
     trips_merged_df = trips_merged
     land_use_df = land_use
 
-    proposed_trip_departure_period = model_settings["TRIP_DEPARTURE_PERIOD"]
+    proposed_trip_departure_period = model_settings.TRIP_DEPARTURE_PERIOD
     # TODO: the number of skim time periods should be more readily available than this
     n_skim_time_periods = np.unique(
-        network_los.los_settings.skim_time_periods["labels"]
+        network_los.los_settings.skim_time_periods.labels
     ).size
     if trips_merged_df[proposed_trip_departure_period].max() > n_skim_time_periods:
         # max proposed_trip_departure_period is out of range,
@@ -320,7 +407,7 @@ def parking_location(
             trips_merged_df["trip_period"] = network_los.skim_time_period_label(
                 trips_merged_df[proposed_trip_departure_period], as_cat=True
             )
-        model_settings["TRIP_DEPARTURE_PERIOD"] = "trip_period"
+        model_settings.TRIP_DEPARTURE_PERIOD = "trip_period"
 
     locals_dict = {"network_los": network_los}
 
@@ -348,7 +435,12 @@ def parking_location(
         trace_label=trace_label,
     )
 
-    assign_in_place(trips_df, parking_locations.to_frame(alt_destination_col_name))
+    assign_in_place(
+        trips_df,
+        parking_locations.to_frame(alt_destination_col_name),
+        state.settings.downcast_int,
+        state.settings.downcast_float,
+    )
 
     state.add_table("trips", trips_df)
 
@@ -366,12 +458,10 @@ def parking_location(
             trips_df[trips_df.trip_num < trips_df.trip_count]
         )
 
-        sample_table_name = model_settings.get("PARKING_LOCATION_SAMPLE_TABLE_NAME")
+        sample_table_name = model_settings.PARKING_LOCATION_SAMPLE_TABLE_NAME
         assert sample_table_name is not None
 
-        logger.info(
-            "adding %s samples to %s" % (len(save_sample_df), sample_table_name)
-        )
+        logger.info(f"adding {len(save_sample_df)} samples to {sample_table_name}")
 
         # lest they try to put tour samples into the same table
         if state.is_table(sample_table_name):

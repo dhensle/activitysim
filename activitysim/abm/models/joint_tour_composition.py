@@ -15,6 +15,8 @@ from activitysim.core import (
     tracing,
     workflow,
 )
+from activitysim.core.configuration.base import PreprocessorSettings
+from activitysim.core.configuration.logit import LogitComponentSettings
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +24,20 @@ logger = logging.getLogger(__name__)
 def add_null_results(state, trace_label, tours):
     logger.info("Skipping %s: add_null_results" % trace_label)
     tours["composition"] = ""
+    cat_type = pd.api.types.CategoricalDtype(
+        ["", "adults", "children", "mixed"], ordered=False
+    )
+    tours["composition"] = tours["composition"].astype(cat_type)
     state.add_table("tours", tours)
+
+
+class JointTourCompositionSettings(LogitComponentSettings, extra="forbid"):
+    """
+    Settings for the `joint_tour_composition` component.
+    """
+
+    preprocessor: PreprocessorSettings | None = None
+    """Setting for the preprocessor."""
 
 
 @workflow.step
@@ -31,21 +46,27 @@ def joint_tour_composition(
     tours: pd.DataFrame,
     households: pd.DataFrame,
     persons: pd.DataFrame,
+    model_settings: JointTourCompositionSettings | None = None,
+    model_settings_file_name: str = "joint_tour_composition.yaml",
+    trace_label: str = "joint_tour_composition",
 ) -> None:
     """
     This model predicts the makeup of the travel party (adults, children, or mixed).
     """
-    trace_label = "joint_tour_composition"
-    model_settings_file_name = "joint_tour_composition.yaml"
 
     joint_tours = tours[tours.tour_category == "joint"]
+
+    if model_settings is None:
+        model_settings = JointTourCompositionSettings.read_settings_file(
+            state.filesystem,
+            model_settings_file_name,
+        )
 
     # - if no joint tours
     if joint_tours.shape[0] == 0:
         add_null_results(state, trace_label, tours)
         return
 
-    model_settings = state.filesystem.read_model_settings(model_settings_file_name)
     estimator = estimation.manager.begin_estimation(state, "joint_tour_composition")
 
     # - only interested in households with joint_tours
@@ -58,7 +79,7 @@ def joint_tour_composition(
     )
 
     # - run preprocessor
-    preprocessor_settings = model_settings.get("preprocessor", None)
+    preprocessor_settings = model_settings.preprocessor
     if preprocessor_settings:
         locals_dict = {
             "persons": persons,
@@ -78,7 +99,7 @@ def joint_tour_composition(
     )
 
     # - simple_simulate
-    model_spec = state.filesystem.read_model_spec(file_name=model_settings["SPEC"])
+    model_spec = state.filesystem.read_model_spec(file_name=model_settings.SPEC)
     coefficients_df = state.filesystem.read_model_coefficients(model_settings)
     model_spec = simulate.eval_coefficients(
         state, model_spec, coefficients_df, estimator
@@ -102,10 +123,15 @@ def joint_tour_composition(
         trace_label=trace_label,
         trace_choice_name="composition",
         estimator=estimator,
+        compute_settings=model_settings.compute_settings,
     )
 
     # convert indexes to alternative names
     choices = pd.Series(model_spec.columns[choices.values], index=choices.index)
+    cat_type = pd.api.types.CategoricalDtype(
+        model_spec.columns.tolist() + [""], ordered=False
+    )
+    choices = choices.astype(cat_type)
 
     if estimator:
         estimator.write_choices(choices)
@@ -117,7 +143,7 @@ def joint_tour_composition(
     joint_tours["composition"] = choices
 
     # reindex since we ran model on a subset of households
-    tours["composition"] = choices.reindex(tours.index).fillna("").astype(str)
+    tours["composition"] = choices.reindex(tours.index).fillna("")
     state.add_table("tours", tours)
 
     tracing.print_summary(

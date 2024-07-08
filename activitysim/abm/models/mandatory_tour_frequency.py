@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import pandas as pd
 
@@ -15,6 +16,12 @@ from activitysim.core import (
     tracing,
     workflow,
 )
+from activitysim.core.configuration.base import PreprocessorSettings, PydanticReadable
+from activitysim.core.configuration.logit import (
+    BaseLogitComponentSettings,
+    LogitComponentSettings,
+    PreprocessorSettings,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +30,11 @@ def add_null_results(state, trace_label, mandatory_tour_frequency_settings):
     logger.info("Skipping %s: add_null_results", trace_label)
 
     persons = state.get_dataframe("persons")
-    persons["mandatory_tour_frequency"] = ""
+    persons["mandatory_tour_frequency"] = pd.categorical(
+        "",
+        categories=["", "work1", "work2", "school1", "school2", "work_and_school"],
+        ordered=False,
+    )
 
     tours = pd.DataFrame()
     tours["tour_category"] = None
@@ -42,20 +53,37 @@ def add_null_results(state, trace_label, mandatory_tour_frequency_settings):
     state.add_table("persons", persons)
 
 
+class MandatoryTourFrequencySettings(LogitComponentSettings, extra="forbid"):
+    """
+    Settings for the `mandatory_tour_frequency` component.
+    """
+
+    preprocessor: PreprocessorSettings | None = None
+    """Setting for the preprocessor."""
+
+    annotate_persons: PreprocessorSettings | None = None
+
+
 @workflow.step
 def mandatory_tour_frequency(
     state: workflow.State,
     persons_merged: pd.DataFrame,
+    model_settings: MandatoryTourFrequencySettings | None = None,
+    model_settings_file_name: str = "mandatory_tour_frequency.yaml",
+    trace_label: str = "mandatory_tour_frequency",
 ) -> None:
     """
     This model predicts the frequency of making mandatory trips (see the
     alternatives above) - these trips include work and school in some combination.
     """
-    trace_label = "mandatory_tour_frequency"
-    model_settings_file_name = "mandatory_tour_frequency.yaml"
+
     trace_hh_id = state.settings.trace_hh_id
 
-    model_settings = state.filesystem.read_model_settings(model_settings_file_name)
+    if model_settings is None:
+        model_settings = MandatoryTourFrequencySettings.read_settings_file(
+            state.filesystem,
+            model_settings_file_name,
+        )
 
     choosers = persons_merged
     # filter based on results of CDAP
@@ -68,7 +96,7 @@ def mandatory_tour_frequency(
         return
 
     # - preprocessor
-    preprocessor_settings = model_settings.get("preprocessor", None)
+    preprocessor_settings = model_settings.preprocessor
     if preprocessor_settings:
         locals_dict = {}
 
@@ -82,7 +110,7 @@ def mandatory_tour_frequency(
 
     estimator = estimation.manager.begin_estimation(state, "mandatory_tour_frequency")
 
-    model_spec = state.filesystem.read_model_spec(file_name=model_settings["SPEC"])
+    model_spec = state.filesystem.read_model_spec(file_name=model_settings.SPEC)
     coefficients_df = state.filesystem.read_model_coefficients(model_settings)
     model_spec = simulate.eval_coefficients(
         state, model_spec, coefficients_df, estimator
@@ -106,10 +134,15 @@ def mandatory_tour_frequency(
         trace_label=trace_label,
         trace_choice_name="mandatory_tour_frequency",
         estimator=estimator,
+        compute_settings=model_settings.compute_settings,
     )
 
     # convert indexes to alternative names
     choices = pd.Series(model_spec.columns[choices.values], index=choices.index)
+    cat_type = pd.api.types.CategoricalDtype(
+        model_spec.columns.tolist() + [""], ordered=False
+    )
+    choices = choices.astype(cat_type)
 
     if estimator:
         estimator.write_choices(choices)
@@ -134,6 +167,12 @@ def mandatory_tour_frequency(
         state, persons=choosers, mandatory_tour_frequency_alts=alternatives
     )
 
+    # convert purpose to pandas categoricals
+    purpose_type = pd.api.types.CategoricalDtype(
+        alternatives.columns.tolist() + ["univ", "home", "escort"], ordered=False
+    )
+    mandatory_tours["tour_type"] = mandatory_tours["tour_type"].astype(purpose_type)
+
     tours = state.extend_table("tours", mandatory_tours)
     state.tracing.register_traceable_table("tours", mandatory_tours)
     state.get_rn_generator().add_channel("tours", mandatory_tours)
@@ -142,14 +181,12 @@ def mandatory_tour_frequency(
     persons = state.get_dataframe("persons")
 
     # need to reindex as we only handled persons with cdap_activity == 'M'
-    persons["mandatory_tour_frequency"] = (
-        choices.reindex(persons.index).fillna("").astype(str)
-    )
+    persons["mandatory_tour_frequency"] = choices.reindex(persons.index).fillna("")
 
     expressions.assign_columns(
         state,
         df=persons,
-        model_settings=model_settings.get("annotate_persons"),
+        model_settings=model_settings.annotate_persons,
         trace_label=tracing.extend_trace_label(trace_label, "annotate_persons"),
     )
 

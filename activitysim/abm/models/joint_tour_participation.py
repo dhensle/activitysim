@@ -19,6 +19,8 @@ from activitysim.core import (
     tracing,
     workflow,
 )
+from activitysim.core.configuration.base import ComputeSettings, PreprocessorSettings
+from activitysim.core.configuration.logit import LogitComponentSettings
 from activitysim.core.util import assign_in_place, reindex
 
 logger = logging.getLogger(__name__)
@@ -91,7 +93,7 @@ def get_tour_satisfaction(candidates, participate):
 
         x = (
             candidates[cols]
-            .groupby(["tour_id", "composition"])
+            .groupby(["tour_id", "composition"], observed=True)
             .agg(
                 participants=("adult", "size"),
                 adults=("adult", "sum"),
@@ -164,16 +166,16 @@ def participants_chooser(
     assert probs.index.equals(choosers.index)
 
     # choice is boolean (participate or not)
-    model_settings = state.filesystem.read_model_settings(
-        "joint_tour_participation.yaml"
+    model_settings = JointTourParticipationSettings.read_settings_file(
+        state.filesystem, "joint_tour_participation.yaml", mandatory=False
     )
 
-    choice_col = model_settings.get("participation_choice", "participate")
+    choice_col = model_settings.participation_choice
     assert (
         choice_col in spec.columns
     ), "couldn't find participation choice column '%s' in spec"
     PARTICIPATE_CHOICE = spec.columns.get_loc(choice_col)
-    MAX_ITERATIONS = model_settings.get("max_participation_choice_iterations", 5000)
+    MAX_ITERATIONS = model_settings.max_participation_choice_iterations
 
     trace_label = tracing.extend_trace_label(trace_label, "participants_chooser")
 
@@ -205,7 +207,7 @@ def participants_chooser(
             )
             print(unsatisfied_candidates.head(20))
 
-            if model_settings.get("FORCE_PARTICIPATION", False):
+            if model_settings.FORCE_PARTICIPATION:
                 logger.warning(
                     f"Forcing joint tour participation for {num_tours_remaining} tours."
                 )
@@ -213,6 +215,10 @@ def participants_chooser(
                 probs[choice_col] = np.where(probs[choice_col] > 0, 1, 0)
                 non_choice_col = [col for col in probs.columns if col != choice_col][0]
                 probs[non_choice_col] = 1 - probs[choice_col]
+                if iter > MAX_ITERATIONS + 1:
+                    raise RuntimeError(
+                        f"{num_tours_remaining} tours could not be satisfied even with forcing participation"
+                    )
             else:
                 raise RuntimeError(
                     f"{num_tours_remaining} tours could not be satisfied after {iter} iterations"
@@ -269,19 +275,27 @@ def participants_chooser(
     return choices, rands
 
 
-def annotate_jtp(state: workflow.State, model_settings, trace_label):
+def annotate_jtp(
+    state: workflow.State,
+    model_settings: JointTourParticipationSettings,
+    trace_label: str,
+):
     # - annotate persons
     persons = state.get_dataframe("persons")
     expressions.assign_columns(
         state,
         df=persons,
-        model_settings=model_settings.get("annotate_persons"),
+        model_settings=model_settings.annotate_persons,
         trace_label=tracing.extend_trace_label(trace_label, "annotate_persons"),
     )
     state.add_table("persons", persons)
 
 
-def add_null_results(state, model_settings, trace_label):
+def add_null_results(
+    state: workflow.State,
+    model_settings: JointTourParticipationSettings,
+    trace_label: str,
+):
     logger.info("Skipping %s: joint tours", trace_label)
     # participants table is used downstream in non-joint tour expressions
 
@@ -295,18 +309,42 @@ def add_null_results(state, model_settings, trace_label):
     annotate_jtp(state, model_settings, trace_label)
 
 
+class JointTourParticipationSettings(LogitComponentSettings, extra="forbid"):
+    """
+    Settings for the `joint_tour_participation` component.
+    """
+
+    preprocessor: PreprocessorSettings | None = None
+    """Setting for the preprocessor."""
+
+    annotate_persons: PreprocessorSettings | None = None
+    """Instructions for annotating the persons table."""
+
+    participation_choice: str = "participate"
+
+    max_participation_choice_iterations: int = 5000
+
+    FORCE_PARTICIPATION: bool = False
+
+
 @workflow.step
 def joint_tour_participation(
     state: workflow.State,
     tours: pd.DataFrame,
     persons_merged: pd.DataFrame,
+    model_settings: JointTourParticipationSettings | None = None,
+    model_settings_file_name: str = "joint_tour_participation.yaml",
+    trace_label: str = "joint_tour_participation",
 ) -> None:
     """
     Predicts for each eligible person to participate or not participate in each joint tour.
     """
-    trace_label = "joint_tour_participation"
-    model_settings_file_name = "joint_tour_participation.yaml"
-    model_settings = state.filesystem.read_model_settings(model_settings_file_name)
+
+    if model_settings is None:
+        model_settings = JointTourParticipationSettings.read_settings_file(
+            state.filesystem,
+            model_settings_file_name,
+        )
     trace_hh_id = state.settings.trace_hh_id
 
     joint_tours = tours[tours.tour_category == "joint"]
@@ -327,7 +365,7 @@ def joint_tour_participation(
     )
 
     # - preprocessor
-    preprocessor_settings = model_settings.get("preprocessor", None)
+    preprocessor_settings = model_settings.preprocessor
     if preprocessor_settings:
         locals_dict = {
             "person_time_window_overlap": lambda x: person_time_window_overlap(
@@ -348,7 +386,7 @@ def joint_tour_participation(
 
     estimator = estimation.manager.begin_estimation(state, "joint_tour_participation")
 
-    model_spec = state.filesystem.read_model_spec(file_name=model_settings["SPEC"])
+    model_spec = state.filesystem.read_model_spec(file_name=model_settings.SPEC)
     coefficients_df = state.filesystem.read_model_coefficients(model_settings)
     model_spec = simulate.eval_coefficients(
         state, model_spec, coefficients_df, estimator
@@ -371,6 +409,15 @@ def joint_tour_participation(
     )
     candidates["chunk_id"] = reindex(household_chunk_ids, candidates.household_id)
 
+    # these hardcoded columns need to be protected from being dropped
+    assert model_settings is not None
+    if model_settings.compute_settings is None:
+        model_settings.compute_settings = ComputeSettings()
+    assert model_settings.compute_settings is not None
+    for i in ["person_is_preschool", "composition", "adult"]:
+        if i not in model_settings.compute_settings.protect_columns:
+            model_settings.compute_settings.protect_columns.append(i)
+
     choices = simulate.simple_simulate_by_chunk_id(
         state,
         choosers=candidates,
@@ -381,10 +428,11 @@ def joint_tour_participation(
         trace_choice_name="participation",
         custom_chooser=participants_chooser,
         estimator=estimator,
+        compute_settings=model_settings.compute_settings,
     )
 
     # choice is boolean (participate or not)
-    choice_col = model_settings.get("participation_choice", "participate")
+    choice_col = model_settings.participation_choice
     assert (
         choice_col in model_spec.columns
     ), "couldn't find participation choice column '%s' in spec"
@@ -442,7 +490,12 @@ def joint_tour_participation(
     # update number_of_participants which was initialized to 1
     joint_tours["number_of_participants"] = participants.groupby("tour_id").size()
 
-    assign_in_place(tours, joint_tours[["person_id", "number_of_participants"]])
+    assign_in_place(
+        tours,
+        joint_tours[["person_id", "number_of_participants"]],
+        state.settings.downcast_int,
+        state.settings.downcast_float,
+    )
 
     state.add_table("tours", tours)
 

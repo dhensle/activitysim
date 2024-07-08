@@ -11,10 +11,13 @@ from activitysim.abm.models.util import logsums as logsum
 from activitysim.abm.models.util import tour_destination
 from activitysim.abm.tables import shadow_pricing
 from activitysim.core import estimation, expressions, los, simulate, tracing, workflow
+from activitysim.core.configuration.logit import (
+    TourLocationComponentSettings,
+    TourModeComponentSettings,
+)
 from activitysim.core.interaction_sample import interaction_sample
 from activitysim.core.interaction_sample_simulate import interaction_sample_simulate
-
-# import multiprocessing
+from activitysim.core.util import reindex
 
 
 """
@@ -75,7 +78,7 @@ ALT_LOGSUM = "mode_choice_logsum"
 def write_estimation_specs(
     state: workflow.State,
     estimator: estimation.Estimator,
-    model_settings,
+    model_settings: TourLocationComponentSettings,
     settings_file,
 ):
     """
@@ -91,8 +94,8 @@ def write_estimation_specs(
 
     estimator.write_model_settings(model_settings, settings_file)
     # estimator.write_spec(model_settings, tag='SAMPLE_SPEC')
-    estimator.write_spec(model_settings, tag="SPEC")
-    estimator.write_coefficients(model_settings=model_settings)
+    estimator.write_spec(file_name=model_settings.SPEC, tag="SPEC")
+    estimator.write_coefficients(file_name=model_settings.COEFFICIENTS)
 
     estimator.write_table(
         state.get_injectable("size_terms"), "size_terms", append=False
@@ -107,7 +110,7 @@ def _location_sample(
     alternatives,
     skims,
     estimator,
-    model_settings,
+    model_settings: TourLocationComponentSettings,
     alt_dest_col_name,
     chunk_size,
     chunk_tag,
@@ -135,20 +138,19 @@ def _location_sample(
 
     logger.info("Running %s with %d persons" % (trace_label, len(choosers.index)))
 
-    sample_size = model_settings["SAMPLE_SIZE"]
+    sample_size = model_settings.SAMPLE_SIZE
 
-    if "sched" in trace_label:
-        print()
-
-    if state.settings.disable_destination_sampling or (
-        estimator and estimator.want_unsampled_alternatives
-    ):
-        # FIXME interaction_sample will return unsampled complete alternatives with probs and pick_count
+    if estimator:
+        sample_size = model_settings.ESTIMATION_SAMPLE_SIZE
         logger.info(
-            "Estimation mode for %s using unsampled alternatives short_circuit_choices"
-            % (trace_label,)
+            f"Estimation mode for {trace_label} using sample size of {sample_size}"
         )
+
+    if state.settings.disable_destination_sampling:
         sample_size = 0
+        logger.info(
+            f"SAMPLE_SIZE set to 0 for {trace_label} because disable_destination_sampling is set"
+        )
 
     locals_d = {
         "skims": skims,
@@ -156,16 +158,19 @@ def _location_sample(
         "orig_col_name": skims.orig_key,  # added for sharrow flows
         "dest_col_name": skims.dest_key,  # added for sharrow flows
         "timeframe": "timeless",
+        "reindex": reindex,
+        "land_use": state.get_dataframe("land_use"),
     }
-    constants = model_settings.get("CONSTANTS", {})
-    locals_d.update(constants)
+    locals_d.update(model_settings.CONSTANTS or {})
 
     spec = simulate.spec_for_segment(
         state,
-        model_settings,
+        None,
         spec_id="SAMPLE_SPEC",
         segment_name=segment_name,
         estimator=estimator,
+        spec_file_name=model_settings.SAMPLE_SPEC,
+        coefficients_file_name=model_settings.COEFFICIENTS,
     )
 
     # here since presumably we want this when called for either sample or presample
@@ -185,6 +190,10 @@ def _location_sample(
         chunk_tag=chunk_tag,
         trace_label=trace_label,
         zone_layer=zone_layer,
+        explicit_chunk_size=model_settings.explicit_chunk,
+        compute_settings=model_settings.compute_settings.subcomponent_settings(
+            "sample"
+        ),
     )
 
     return choices
@@ -197,13 +206,13 @@ def location_sample(
     network_los,
     dest_size_terms,
     estimator,
-    model_settings,
+    model_settings: TourLocationComponentSettings,
     chunk_size,
     chunk_tag,
     trace_label,
 ):
     # FIXME - MEMORY HACK - only include columns actually used in spec
-    chooser_columns = model_settings["SIMULATE_CHOOSER_COLUMNS"]
+    chooser_columns = model_settings.SIMULATE_CHOOSER_COLUMNS
     choosers = persons_merged[chooser_columns]
 
     # create wrapper with keys for this lookup - in this case there is a home_zone_id in the choosers
@@ -213,7 +222,7 @@ def location_sample(
     skim_dict = network_los.get_default_skim_dict()
     skims = skim_dict.wrap("home_zone_id", "zone_id")
 
-    alt_dest_col_name = model_settings["ALT_DEST_COL_NAME"]
+    alt_dest_col_name = model_settings.ALT_DEST_COL_NAME
 
     choices = _location_sample(
         state,
@@ -239,7 +248,10 @@ DEST_MAZ = "dest_MAZ"
 
 
 def aggregate_size_terms(
-    state: workflow.State, dest_size_terms, network_los, model_settings
+    state: workflow.State,
+    dest_size_terms,
+    network_los: los.Network_LOS,
+    model_settings: TourLocationComponentSettings,
 ):
     #
     # aggregate MAZ_size_terms to TAZ_size_terms
@@ -278,7 +290,7 @@ def aggregate_size_terms(
 
     spc = shadow_pricing.load_shadow_price_calculator(state, model_settings)
     if spc.use_shadow_pricing and (
-        spc.shadow_settings["SHADOW_PRICE_METHOD"] == "simulation"
+        spc.shadow_settings.SHADOW_PRICE_METHOD == "simulation"
     ):
         # allow TAZs with at least one underassigned MAZ in them, therefore with a shadowprice larger than -999, to be selected again
         TAZ_size_terms["shadow_price_utility_adjustment"] = np.where(
@@ -329,7 +341,7 @@ def location_presample(
     network_los,
     dest_size_terms,
     estimator,
-    model_settings,
+    model_settings: TourLocationComponentSettings,
     chunk_size,
     chunk_tag,
     trace_label,
@@ -338,7 +350,7 @@ def location_presample(
 
     logger.info(f"{trace_label} location_presample")
 
-    alt_dest_col_name = model_settings["ALT_DEST_COL_NAME"]
+    alt_dest_col_name = model_settings.ALT_DEST_COL_NAME
     assert DEST_TAZ != alt_dest_col_name
 
     MAZ_size_terms, TAZ_size_terms = aggregate_size_terms(
@@ -355,7 +367,7 @@ def location_presample(
     # FIXME - MEMORY HACK - only include columns actually used in spec
     # FIXME we don't actually require that land_use provide a TAZ crosswalk
     # FIXME maybe we should add it for multi-zone (from maz_taz) if missing?
-    chooser_columns = model_settings["SIMULATE_CHOOSER_COLUMNS"]
+    chooser_columns = model_settings.SIMULATE_CHOOSER_COLUMNS
     chooser_columns = [HOME_TAZ if c == HOME_MAZ else c for c in chooser_columns]
     choosers = persons_merged[chooser_columns]
 
@@ -406,7 +418,7 @@ def run_location_sample(
     network_los,
     dest_size_terms,
     estimator,
-    model_settings,
+    model_settings: TourLocationComponentSettings,
     chunk_size,
     chunk_tag,
     trace_label,
@@ -479,6 +491,38 @@ def run_location_sample(
             trace_label=trace_label,
         )
 
+    # adding observed choice to alt set when running in estimation mode
+    if estimator:
+        # grabbing survey values
+        survey_persons = estimation.manager.get_survey_table("persons")
+        if "school_location" in trace_label:
+            survey_choices = survey_persons["school_zone_id"].reset_index()
+        elif ("workplace_location" in trace_label) and ("external" not in trace_label):
+            survey_choices = survey_persons["workplace_zone_id"].reset_index()
+        else:
+            return choices
+        survey_choices.columns = ["person_id", "alt_dest"]
+        survey_choices = survey_choices[
+            survey_choices["person_id"].isin(choices.index)
+            & (survey_choices.alt_dest > 0)
+        ]
+        # merging survey destination into table if not available
+        joined_data = survey_choices.merge(
+            choices, on=["person_id", "alt_dest"], how="left", indicator=True
+        )
+        missing_rows = joined_data[joined_data["_merge"] == "left_only"]
+        missing_rows["pick_count"] = 1
+        if len(missing_rows) > 0:
+            new_choices = missing_rows[
+                ["person_id", "alt_dest", "prob", "pick_count"]
+            ].set_index("person_id")
+            choices = choices.append(new_choices, ignore_index=False).sort_index()
+            # making probability the mean of all other sampled destinations by person
+            # FIXME is there a better way to do this? Does this even matter for estimation?
+            choices["prob"] = choices["prob"].fillna(
+                choices.groupby("person_id")["prob"].transform("mean")
+            )
+
     return choices
 
 
@@ -488,7 +532,7 @@ def run_location_logsums(
     persons_merged_df,
     network_los,
     location_sample_df,
-    model_settings,
+    model_settings: TourLocationComponentSettings,
     chunk_size,
     chunk_tag,
     trace_label,
@@ -516,8 +560,10 @@ def run_location_logsums(
 
     assert not location_sample_df.empty
 
-    logsum_settings = state.filesystem.read_model_settings(
-        model_settings["LOGSUM_SETTINGS"]
+    logsum_settings = TourModeComponentSettings.read_settings_file(
+        state.filesystem,
+        str(model_settings.LOGSUM_SETTINGS),
+        mandatory=False,
     )
 
     # FIXME - MEMORY HACK - only include columns actually used in spec
@@ -525,17 +571,15 @@ def run_location_logsums(
         persons_merged_df, logsum_settings, model_settings
     )
 
-    logger.info(
-        "Running %s with %s rows" % (trace_label, len(location_sample_df.index))
-    )
+    logger.info(f"Running {trace_label} with {len(location_sample_df.index)} rows")
 
     choosers = location_sample_df.join(persons_merged_df, how="left")
 
-    tour_purpose = model_settings["LOGSUM_TOUR_PURPOSE"]
+    tour_purpose = model_settings.LOGSUM_TOUR_PURPOSE
     if isinstance(tour_purpose, dict):
         tour_purpose = tour_purpose[segment_name]
 
-    logsums = logsum.compute_logsums(
+    logsums = logsum.compute_location_choice_logsums(
         state,
         choosers,
         tour_purpose,
@@ -565,7 +609,7 @@ def run_location_simulate(
     dest_size_terms,
     want_logsums,
     estimator,
-    model_settings,
+    model_settings: TourLocationComponentSettings,
     chunk_size,
     chunk_tag,
     trace_label,
@@ -586,10 +630,10 @@ def run_location_simulate(
     assert not persons_merged.empty
 
     # FIXME - MEMORY HACK - only include columns actually used in spec
-    chooser_columns = model_settings["SIMULATE_CHOOSER_COLUMNS"]
+    chooser_columns = model_settings.SIMULATE_CHOOSER_COLUMNS
     choosers = persons_merged[chooser_columns]
 
-    alt_dest_col_name = model_settings["ALT_DEST_COL_NAME"]
+    alt_dest_col_name = model_settings.ALT_DEST_COL_NAME
 
     # alternatives are pre-sampled and annotated with logsums and pick_count
     # but we have to merge additional alt columns into alt sample list
@@ -615,10 +659,10 @@ def run_location_simulate(
         "orig_col_name": skims.orig_key,  # added for sharrow flows
         "dest_col_name": skims.dest_key,  # added for sharrow flows
         "timeframe": "timeless",
+        "reindex": reindex,
+        "land_use": state.get_dataframe("land_use"),
     }
-    constants = model_settings.get("CONSTANTS", {})
-    if constants is not None:
-        locals_d.update(constants)
+    locals_d.update(model_settings.CONSTANTS or {})
 
     if estimator:
         # write choosers after annotation
@@ -628,10 +672,12 @@ def run_location_simulate(
 
     spec = simulate.spec_for_segment(
         state,
-        model_settings,
+        None,
         spec_id="SPEC",
         segment_name=segment_name,
         estimator=estimator,
+        spec_file_name=model_settings.SPEC,
+        coefficients_file_name=model_settings.COEFFICIENTS,
     )
 
     log_alt_losers = state.settings.log_alt_losers
@@ -649,9 +695,13 @@ def run_location_simulate(
         chunk_size=chunk_size,
         chunk_tag=chunk_tag,
         trace_label=trace_label,
-        trace_choice_name=model_settings["DEST_CHOICE_COLUMN_NAME"],
+        trace_choice_name=model_settings.DEST_CHOICE_COLUMN_NAME,
         estimator=estimator,
         skip_choice=skip_choice,
+        explicit_chunk_size=model_settings.explicit_chunk,
+        compute_settings=model_settings.compute_settings.subcomponent_settings(
+            "simulate"
+        ),
     )
 
     if not want_logsums:
@@ -672,7 +722,7 @@ def run_location_choice(
     want_logsums,
     want_sample_table,
     estimator,
-    model_settings,
+    model_settings: TourLocationComponentSettings,
     chunk_size,
     chunk_tag,
     trace_label,
@@ -706,10 +756,10 @@ def run_location_choice(
     logsums optional & only returned if DEST_CHOICE_LOGSUM_COLUMN_NAME specified in model_settings
     """
 
-    chooser_segment_column = model_settings["CHOOSER_SEGMENT_COLUMN_NAME"]
+    chooser_segment_column = model_settings.CHOOSER_SEGMENT_COLUMN_NAME
 
     # maps segment names to compact (integer) ids
-    segment_ids = model_settings["SEGMENT_IDS"]
+    segment_ids = model_settings.SEGMENT_IDS
 
     choices_list = []
     sample_list = []
@@ -790,7 +840,7 @@ def run_location_choice(
             choices_df.choice = estimator.get_survey_values(
                 choices_df.choice,
                 "persons",
-                column_names=model_settings["DEST_CHOICE_COLUMN_NAME"],
+                column_names=model_settings.DEST_CHOICE_COLUMN_NAME,
             )
             estimator.write_override_choices(choices_df.choice)
 
@@ -803,7 +853,7 @@ def run_location_choice(
 
                 # merge mode_choice_logsum for the overridden location
                 # alt_logsums columns: ['person_id', 'choice', 'logsum']
-                alt_dest_col = model_settings["ALT_DEST_COL_NAME"]
+                alt_dest_col = model_settings.ALT_DEST_COL_NAME
                 alt_logsums = (
                     location_sample_df[[alt_dest_col, ALT_LOGSUM]]
                     .rename(columns={alt_dest_col: "choice", ALT_LOGSUM: "logsum"})
@@ -828,12 +878,30 @@ def run_location_choice(
                 )
                 state.tracing.trace_df(choices_df, estimation_trace_label)
 
+        if want_logsums & (not skip_choice):
+            # grabbing index, could be person_id or proto_person_id
+            index_name = choices_df.index.name
+            # merging mode choice logsum of chosen alternative to choices
+            choices_df = (
+                pd.merge(
+                    choices_df.reset_index(),
+                    location_sample_df.reset_index()[
+                        [index_name, model_settings.ALT_DEST_COL_NAME, ALT_LOGSUM]
+                    ],
+                    how="left",
+                    left_on=[index_name, "choice"],
+                    right_on=[index_name, model_settings.ALT_DEST_COL_NAME],
+                )
+                .drop(columns=model_settings.ALT_DEST_COL_NAME)
+                .set_index(index_name)
+            )
+
         choices_list.append(choices_df)
 
         if want_sample_table:
             # FIXME - sample_table
             location_sample_df.set_index(
-                model_settings["ALT_DEST_COL_NAME"], append=True, inplace=True
+                model_settings.ALT_DEST_COL_NAME, append=True, inplace=True
             )
             sample_list.append(location_sample_df)
         else:
@@ -845,7 +913,7 @@ def run_location_choice(
     else:
         # this will only happen with small samples (e.g. singleton) with no (e.g.) school segs
         logger.warning("%s no choices", trace_label)
-        choices_df = pd.DataFrame(columns=["choice", "logsum"])
+        choices_df = pd.DataFrame(columns=["choice", "logsum", ALT_LOGSUM])
 
     if len(sample_list) > 0:
         save_sample_df = pd.concat(sample_list)
@@ -858,15 +926,15 @@ def run_location_choice(
 
 def iterate_location_choice(
     state: workflow.State,
-    model_settings,
-    persons_merged,
-    persons,
-    households,
-    network_los,
-    estimator,
-    chunk_size,
+    model_settings: TourLocationComponentSettings,
+    persons_merged: pd.DataFrame,
+    persons: pd.DataFrame,
+    households: pd.DataFrame,
+    network_los: los.Network_LOS,
+    estimator: estimation.Estimator,
+    chunk_size: int,
     locutor: bool,
-    trace_label,
+    trace_label: str,
 ):
     """
     iterate run_location_choice updating shadow pricing until convergence criteria satisfied
@@ -888,19 +956,24 @@ def iterate_location_choice(
     Returns
     -------
     adds choice column model_settings['DEST_CHOICE_COLUMN_NAME']
-    adds logsum column model_settings['DEST_CHOICE_LOGSUM_COLUMN_NAME']- if provided
+    adds destination choice logsum column model_settings['DEST_CHOICE_LOGSUM_COLUMN_NAME']- if provided
+    adds mode choice logsum to selected destination column model_settings['MODE_CHOICE_LOGSUM_COLUMN_NAME']- if provided
     adds annotations to persons table
     """
 
     chunk_tag = trace_label
 
     # boolean to filter out persons not needing location modeling (e.g. is_worker, is_student)
-    chooser_filter_column = model_settings["CHOOSER_FILTER_COLUMN_NAME"]
+    chooser_filter_column = model_settings.CHOOSER_FILTER_COLUMN_NAME
 
-    dest_choice_column_name = model_settings["DEST_CHOICE_COLUMN_NAME"]
-    logsum_column_name = model_settings.get("DEST_CHOICE_LOGSUM_COLUMN_NAME")
+    dest_choice_column_name = model_settings.DEST_CHOICE_COLUMN_NAME
+    dc_logsum_column_name = model_settings.DEST_CHOICE_LOGSUM_COLUMN_NAME
+    mc_logsum_column_name = model_settings.MODE_CHOICE_LOGSUM_COLUMN_NAME
+    want_logsums = (dc_logsum_column_name is not None) | (
+        mc_logsum_column_name is not None
+    )
 
-    sample_table_name = model_settings.get("DEST_CHOICE_SAMPLE_TABLE_NAME")
+    sample_table_name = model_settings.DEST_CHOICE_SAMPLE_TABLE_NAME
     want_sample_table = (
         state.settings.want_dest_choice_sample_tables and sample_table_name is not None
     )
@@ -914,8 +987,8 @@ def iterate_location_choice(
     )  # interaction_sample expects chooser index to be monotonic increasing
 
     # chooser segmentation allows different sets coefficients for e.g. different income_segments or tour_types
-    chooser_segment_column = model_settings["CHOOSER_SEGMENT_COLUMN_NAME"]
-    segment_ids = model_settings["SEGMENT_IDS"]
+    chooser_segment_column = model_settings.CHOOSER_SEGMENT_COLUMN_NAME
+    segment_ids = model_settings.SEGMENT_IDS
 
     assert (
         chooser_segment_column in persons_merged_df
@@ -925,7 +998,7 @@ def iterate_location_choice(
     max_iterations = spc.max_iterations
     assert not (spc.use_shadow_pricing and estimator)
 
-    logger.debug("%s max_iterations: %s" % (trace_label, max_iterations))
+    logger.debug(f"{trace_label} max_iterations: {max_iterations}")
 
     save_sample_df = (
         choices_df
@@ -937,7 +1010,7 @@ def iterate_location_choice(
         if spc.use_shadow_pricing and iteration > 1:
             spc.update_shadow_prices(state)
 
-            if spc.shadow_settings["SHADOW_PRICE_METHOD"] == "simulation":
+            if spc.shadow_settings.SHADOW_PRICE_METHOD == "simulation":
                 # filter from the sampled persons
                 persons_merged_df_ = persons_merged_df_[
                     persons_merged_df_.index.isin(spc.sampled_persons.index)
@@ -949,7 +1022,7 @@ def iterate_location_choice(
             persons_merged_df_,
             network_los,
             shadow_price_calculator=spc,
-            want_logsums=logsum_column_name is not None,
+            want_logsums=want_logsums,
             want_sample_table=want_sample_table,
             estimator=estimator,
             model_settings=model_settings,
@@ -965,7 +1038,7 @@ def iterate_location_choice(
         if spc.use_shadow_pricing:
             # handle simulation method
             if (
-                spc.shadow_settings["SHADOW_PRICE_METHOD"] == "simulation"
+                spc.shadow_settings.SHADOW_PRICE_METHOD == "simulation"
                 and iteration > 1
             ):
                 # if a process ends up with no sampled workers in it, hence an empty choice_df_, then choice_df wil be what it was previously
@@ -1007,10 +1080,10 @@ def iterate_location_choice(
 
     # - shadow price table
     if locutor:
-        if spc.use_shadow_pricing and "SHADOW_PRICE_TABLE" in model_settings:
-            state.add_table(model_settings["SHADOW_PRICE_TABLE"], spc.shadow_prices)
-        if "MODELED_SIZE_TABLE" in model_settings:
-            state.add_table(model_settings["MODELED_SIZE_TABLE"], spc.modeled_size)
+        if spc.use_shadow_pricing and model_settings.SHADOW_PRICE_TABLE:
+            state.add_table(model_settings.SHADOW_PRICE_TABLE, spc.shadow_prices)
+        if model_settings.MODELED_SIZE_TABLE:
+            state.add_table(model_settings.MODELED_SIZE_TABLE, spc.modeled_size)
 
     persons_df = persons
 
@@ -1024,9 +1097,14 @@ def iterate_location_choice(
     )
 
     # add the dest_choice_logsum column to persons dataframe
-    if logsum_column_name:
-        persons_df[logsum_column_name] = (
+    if dc_logsum_column_name:
+        persons_df[dc_logsum_column_name] = (
             choices_df["logsum"].reindex(persons_df.index).astype("float")
+        )
+    # add the mode choice logsum column to persons dataframe
+    if mc_logsum_column_name:
+        persons_df[mc_logsum_column_name] = (
+            choices_df[ALT_LOGSUM].reindex(persons_df.index).astype("float")
         )
 
     if save_sample_df is not None:
@@ -1040,11 +1118,11 @@ def iterate_location_choice(
         state.extend_table(sample_table_name, save_sample_df)
 
     # - annotate persons table
-    if "annotate_persons" in model_settings:
+    if model_settings.annotate_persons:
         expressions.assign_columns(
             state,
             df=persons_df,
-            model_settings=model_settings.get("annotate_persons"),
+            model_settings=model_settings.annotate_persons,
             trace_label=tracing.extend_trace_label(trace_label, "annotate_persons"),
         )
 
@@ -1054,12 +1132,12 @@ def iterate_location_choice(
             state.tracing.trace_df(persons_df, label=trace_label, warn_if_empty=True)
 
     # - annotate households table
-    if "annotate_households" in model_settings:
+    if model_settings.annotate_households:
         households_df = households
         expressions.assign_columns(
             state,
             df=households_df,
-            model_settings=model_settings.get("annotate_households"),
+            model_settings=model_settings.annotate_households,
             trace_label=tracing.extend_trace_label(trace_label, "annotate_households"),
         )
         state.add_table("households", households_df)
@@ -1067,9 +1145,13 @@ def iterate_location_choice(
         if state.settings.trace_hh_id:
             state.tracing.trace_df(households_df, label=trace_label, warn_if_empty=True)
 
-    if logsum_column_name:
+    if dc_logsum_column_name:
         tracing.print_summary(
-            logsum_column_name, choices_df["logsum"], value_counts=True
+            dc_logsum_column_name, choices_df["logsum"], value_counts=True
+        )
+    if mc_logsum_column_name:
+        tracing.print_summary(
+            mc_logsum_column_name, choices_df[ALT_LOGSUM], value_counts=True
         )
 
     return persons_df
@@ -1083,26 +1165,25 @@ def workplace_location(
     households: pd.DataFrame,
     network_los: los.Network_LOS,
     locutor: bool,
+    model_settings: TourLocationComponentSettings | None = None,
+    model_settings_file_name: str = "workplace_location.yaml",
+    trace_label: str = "workplace_location",
 ) -> None:
     """
     workplace location choice model
 
     iterate_location_choice adds location choice column and annotations to persons table
     """
-
-    trace_label = "workplace_location"
-    model_settings = state.filesystem.read_model_settings("workplace_location.yaml")
-
+    if model_settings is None:
+        model_settings = TourLocationComponentSettings.read_settings_file(
+            state.filesystem,
+            model_settings_file_name,
+        )
     estimator = estimation.manager.begin_estimation(state, "workplace_location")
     if estimator:
         write_estimation_specs(
             state, estimator, model_settings, "workplace_location.yaml"
         )
-
-    # FIXME - debugging code to test multiprocessing failure handling
-    # process_name = multiprocessing.current_process().name
-    # if multiprocessing.current_process().name =='mp_households_0':
-    #     raise RuntimeError(f"fake fail {process_name}")
 
     # disable locutor for benchmarking
     if state.settings.benchmarking:
@@ -1133,6 +1214,9 @@ def school_location(
     households: pd.DataFrame,
     network_los: los.Network_LOS,
     locutor: bool,
+    model_settings: TourLocationComponentSettings | None = None,
+    model_settings_file_name: str = "school_location.yaml",
+    trace_label: str = "school_location",
 ) -> None:
     """
     School location choice model
@@ -1140,8 +1224,11 @@ def school_location(
     iterate_location_choice adds location choice column and annotations to persons table
     """
 
-    trace_label = "school_location"
-    model_settings = state.filesystem.read_model_settings("school_location.yaml")
+    if model_settings is None:
+        model_settings = TourLocationComponentSettings.read_settings_file(
+            state.filesystem,
+            model_settings_file_name,
+        )
 
     estimator = estimation.manager.begin_estimation(state, "school_location")
     if estimator:

@@ -9,32 +9,40 @@ import pandas as pd
 from activitysim.abm.models.util import vectorize_tour_scheduling as vts
 from activitysim.core import config, estimation, expressions, simulate, workflow
 
+from .vectorize_tour_scheduling import TourModeComponentSettings, TourSchedulingSettings
+
 logger = logging.getLogger(__name__)
 
 
 def run_tour_scheduling(
     state: workflow.State,
-    model_name,
-    chooser_tours,
-    persons_merged,
-    tdd_alts,
-    tour_segment_col,
+    model_name: str,
+    chooser_tours: pd.DataFrame,
+    persons_merged: pd.DataFrame,
+    tdd_alts: pd.DataFrame,
+    tour_segment_col: str,
 ):
     trace_label = model_name
     model_settings_file_name = f"{model_name}.yaml"
 
-    model_settings = state.filesystem.read_model_settings(model_settings_file_name)
+    model_settings = TourSchedulingSettings.read_settings_file(
+        state.filesystem,
+        model_settings_file_name,
+        mandatory=False,
+    )
 
-    if "LOGSUM_SETTINGS" in model_settings:
-        logsum_settings = state.filesystem.read_model_settings(
-            model_settings["LOGSUM_SETTINGS"]
+    if model_settings.LOGSUM_SETTINGS:
+        logsum_settings = TourModeComponentSettings.read_settings_file(
+            state.filesystem,
+            str(model_settings.LOGSUM_SETTINGS),
+            mandatory=False,
         )
-        logsum_columns = logsum_settings.get("LOGSUM_CHOOSER_COLUMNS", [])
+        logsum_columns = logsum_settings.LOGSUM_CHOOSER_COLUMNS
     else:
         logsum_columns = []
 
     # - filter chooser columns for both logsums and simulate
-    model_columns = model_settings.get("SIMULATE_CHOOSER_COLUMNS", [])
+    model_columns = model_settings.SIMULATE_CHOOSER_COLUMNS
     chooser_columns = logsum_columns + [
         c for c in model_columns if c not in logsum_columns
     ]
@@ -44,7 +52,7 @@ def run_tour_scheduling(
     timetable = state.get_injectable("timetable")
 
     # - run preprocessor to annotate choosers
-    preprocessor_settings = model_settings.get("preprocessor", None)
+    preprocessor_settings = model_settings.preprocessor
     if preprocessor_settings:
         locals_d = {"tt": timetable.attach_state(state)}
         locals_d.update(config.get_model_constants(model_settings))
@@ -58,11 +66,11 @@ def run_tour_scheduling(
         )
 
     estimators = {}
-    if "TOUR_SPEC_SEGMENTS" in model_settings:
+    if model_settings.TOUR_SPEC_SEGMENTS:
         # load segmented specs
-        spec_segment_settings = model_settings.get("SPEC_SEGMENTS", {})
+        spec_segment_settings = model_settings.SPEC_SEGMENTS
         specs = {}
-        sharrow_skips = {}
+        compute_settings = {}
         for spec_segment_name, spec_settings in spec_segment_settings.items():
             bundle_name = f"{model_name}_{spec_segment_name}"
 
@@ -71,13 +79,15 @@ def run_tour_scheduling(
                 state, model_name=bundle_name, bundle_name=bundle_name
             )
 
-            spec_file_name = spec_settings["SPEC"]
+            spec_file_name = spec_settings.SPEC
             model_spec = state.filesystem.read_model_spec(file_name=spec_file_name)
             coefficients_df = state.filesystem.read_model_coefficients(spec_settings)
             specs[spec_segment_name] = simulate.eval_coefficients(
                 state, model_spec, coefficients_df, estimator
             )
-            sharrow_skips[spec_segment_name] = spec_settings.get("sharrow_skip", False)
+            compute_settings[
+                spec_segment_name
+            ] = spec_settings.compute_settings.subcomponent_settings(spec_segment_name)
 
             if estimator:
                 estimators[spec_segment_name] = estimator  # add to local list
@@ -86,13 +96,13 @@ def run_tour_scheduling(
                 estimator.write_coefficients(coefficients_df, spec_settings)
 
         # - spec dict segmented by primary_purpose
-        tour_segment_settings = model_settings.get("TOUR_SPEC_SEGMENTS", {})
+        tour_segment_settings = model_settings.TOUR_SPEC_SEGMENTS
         tour_segments = {}
         for tour_segment_name, spec_segment_name in tour_segment_settings.items():
             tour_segments[tour_segment_name] = {}
             tour_segments[tour_segment_name]["spec_segment_name"] = spec_segment_name
             tour_segments[tour_segment_name]["spec"] = specs[spec_segment_name]
-            tour_segments[tour_segment_name]["sharrow_skip"] = sharrow_skips[
+            tour_segments[tour_segment_name]["compute_settings"] = compute_settings[
                 spec_segment_name
             ]
             tour_segments[tour_segment_name]["estimator"] = estimators.get(
@@ -105,15 +115,16 @@ def run_tour_scheduling(
 
     else:
         # unsegmented spec
-        assert "SPEC_SEGMENTS" not in model_settings
-        assert "TOUR_SPEC_SEGMENTS" not in model_settings
+        assert (
+            not model_settings.SPEC_SEGMENTS
+        ), f"model_settings.SPEC_SEGMENTS should be omitted not {model_settings.SPEC_SEGMENTS!r}"
+        assert not model_settings.TOUR_SPEC_SEGMENTS
         assert tour_segment_col is None
 
         estimator = estimation.manager.begin_estimation(state, model_name)
 
-        spec_file_name = model_settings["SPEC"]
+        spec_file_name = model_settings.SPEC
         model_spec = state.filesystem.read_model_spec(file_name=spec_file_name)
-        sharrow_skip = model_settings.get("sharrow_skip", False)
         coefficients_df = state.filesystem.read_model_coefficients(model_settings)
         model_spec = simulate.eval_coefficients(
             state, model_spec, coefficients_df, estimator
@@ -129,7 +140,7 @@ def run_tour_scheduling(
         tour_segments = {
             "spec": model_spec,
             "estimator": estimator,
-            "sharrow_skip": sharrow_skip,
+            "compute_settings": model_settings.compute_settings,
         }
 
     if estimators:

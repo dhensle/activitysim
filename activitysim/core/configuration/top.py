@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Literal
 
+from pydantic import model_validator, validator
+
 from activitysim.core.configuration.base import PydanticBase, Union
 
 
@@ -118,6 +120,11 @@ class OutputTables(PydanticBase):
 
     h5_store: bool = False
     """Write tables into a single HDF5 store instead of individual CSVs."""
+
+    file_type: Literal["csv", "parquet", "h5"] = "csv"
+    """
+    Specifies the file type for output tables. Options are limited to 'csv',
+    'h5' or 'parquet'. Only applied if h5_store is set to False."""
 
     action: str
     """Whether to 'include' or 'skip' the enumerated tables in `tables`."""
@@ -284,12 +291,39 @@ class Settings(PydanticBase, extra="allow", validate_assignment=True):
     """
 
     chunk_training_mode: Literal[
-        "disabled", "training", "production", "adaptive"
+        "disabled", "training", "production", "adaptive", "explicit"
     ] = "disabled"
     """
     The method to use for chunk training.
 
-    Valid values include {disabled, training, production, adaptive}.
+    * "disabled"
+        All chunking is disabled. If you have enough RAM, this is the fastest
+        mode, but it requires potentially a lot of RAM.
+    * "training"
+        The model is run in training mode, which tracks the amount of memory
+        used by each table by submodel and writes the results to a cache file
+        that is then re-used for production runs. This mode is significantly
+        slower than production mode since it does significantly more memory
+        inspection.
+    * "production"
+        The model is run in production mode, using the cache file created in
+        training mode. If no such file is found, the model falls back to
+        training mode. This mode is significantly faster than training mode, as
+        it uses the cached memory inspection results to determine chunk sizes.
+    * "adaptive"
+        Like production mode, any existing cache file is used to determine the
+        starting chunk settings, but the model also updates the cache settings
+        based on additional memory inspection. This may additionally improve the
+        cache settings to reduce runtimes when run in production mode, but at
+        the cost of some slowdown during the run to accommodate extra memory
+        inspection.
+    * "explicit"
+        The model is run without memory inspection, and the chunk cache file is
+        not used, even if it exists. Instead, the chunk size settings are
+        explicitly set in the settings file of each compatible model step.  Only
+        those steps that have an "explicit_chunk" setting are chunkable with
+        this mode, all other steps are run without chunking.
+
     See :ref:`chunk_size` for more details.
     """
 
@@ -442,6 +476,26 @@ class Settings(PydanticBase, extra="allow", validate_assignment=True):
     True will disable the use of zarr.
     """
 
+    store_skims_in_shm: bool = True
+    """
+    Store skim dataset in shared memory.
+
+    .. versionadded:: 1.3
+
+    By default, if sharrow is enabled (any setting other than false), ActivitySim
+    stores the skim dataset in shared memory. This can be changed by setting this
+    option to False, in which case skims are stores in "typical" process-local
+    memory. Note that storing skims in shared memory is pretty much required for
+    multiprocessing, unless you have a very small model or an absurdly large amount
+    of RAM.
+    """
+
+    @model_validator(mode="after")
+    def _check_store_skims_in_shm(self):
+        if not self.store_skims_in_shm and self.multiprocess:
+            raise ValueError("store_skims_in_shm requires multiprocess to be False")
+        return self
+
     instrument: bool = False
     """
     Use `pyinstrument` to profile component performance.
@@ -551,6 +605,18 @@ class Settings(PydanticBase, extra="allow", validate_assignment=True):
         compatible with using :py:attr:`Settings.sharrow`.
     """
 
+    omx_ignore_patterns: list[str] = []
+    """
+    List of regex patterns to ignore when reading OMX files.
+
+    This is useful if you have tables in your OMX file that you don't want to
+    read in.  For example, if you have both time-of-day values and time-independent
+    values (e.g., "BIKE_TIME" and "BIKE_TIME__AM"), you can ignore the time-of-day
+    values by setting this to ["BIKE_TIME__.+"].
+
+    .. versionadded:: 1.3
+    """
+
     keep_mem_logs: bool = False
 
     pipeline_complib: str = "NOTSET"
@@ -580,6 +646,7 @@ class Settings(PydanticBase, extra="allow", validate_assignment=True):
         "trace_hh_id",
         "memory_profile",
         "instrument",
+        "sharrow",
     )
     """
     Setting to log on startup.
@@ -611,7 +678,7 @@ class Settings(PydanticBase, extra="allow", validate_assignment=True):
     When this value is True, all config directories are searched in order for
     additional files with the same filename.  If other files are found they
     are also loaded, but only settings values that are not already explicitly
-    set are applied.  Alternatives, set this to a different file name, in which
+    set are applied.  Alternatively, set this to a different file name, in which
     case settings from that other file are loaded (again, backfilling unset
     values only).  Once the settings files are loaded, this value does not
     have any other effect on the operation of the model(s).
@@ -633,6 +700,24 @@ class Settings(PydanticBase, extra="allow", validate_assignment=True):
     * "allow"
         Attempts to re-run a step are allowed, potentially overwriting
         the results from the previous time that step was run.
+    """
+
+    downcast_int: bool = False
+    """
+    automatically downcasting integer variables.
+
+    Use of this setting should be tested by the region to confirm result consistency.
+
+    .. versionadded:: 1.3
+    """
+
+    downcast_float: bool = False
+    """
+    automatically downcasting float variables.
+
+    Use of this setting should be tested by the region to confirm result consistency.
+
+    .. versionadded:: 1.3
     """
 
     other_settings: dict[str, Any] = None

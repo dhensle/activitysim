@@ -52,7 +52,7 @@ def flag_failed_trip_leg_mates(trips_df, col_name):
     #     trips_df.loc[failed_trip_leg_mates, col_name] = True
 
 
-def cleanup_failed_trips(trips):
+def cleanup_failed_trips(state: workflow.State, trips: pd.DataFrame):
     """
     drop failed trips and cleanup fields in leg_mates:
 
@@ -84,7 +84,12 @@ def cleanup_failed_trips(trips):
             ascending=False
         )
 
-        assign_in_place(trips, patch_trips[["trip_num", "trip_count"]])
+        assign_in_place(
+            trips,
+            patch_trips[["trip_num", "trip_count"]],
+            state.settings.downcast_int,
+            state.settings.downcast_float,
+        )
 
         # origin needs to match the previous destination
         # (leaving first origin alone as it's already set correctly)
@@ -151,7 +156,7 @@ def get_time_windows(residual, level):
 
 
 @workflow.cached_object
-def stop_frequency_alts(state: workflow.State):
+def stop_frequency_alts(state: workflow.State) -> pd.DataFrame:
     # alt file for building trips even though simulation is simple_simulate not interaction_simulate
     file_path = state.filesystem.get_config_file_path("stop_frequency_alternatives.csv")
     df = pd.read_csv(file_path, comment="#")
@@ -160,7 +165,10 @@ def stop_frequency_alts(state: workflow.State):
 
 
 def initialize_from_tours(
-    state: workflow.State, tours, stop_frequency_alts, addtl_tour_cols_to_preserve=None
+    state: workflow.State,
+    tours,
+    stop_frequency_alts: pd.DataFrame,
+    addtl_tour_cols_to_preserve=None,
 ):
     """
     Instantiates a trips table based on tour-level attributes: stop frequency,
@@ -168,6 +176,7 @@ def initialize_from_tours(
     """
 
     OUTBOUND_ALT = "out"
+    direction_cat_type = pd.api.types.CategoricalDtype(["out", "in"], ordered=False)
     assert OUTBOUND_ALT in stop_frequency_alts.columns
 
     # get the actual alternatives for each person - have to go back to the

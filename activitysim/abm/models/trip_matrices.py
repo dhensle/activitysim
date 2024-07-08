@@ -3,14 +3,48 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import openmatrix as omx
 import pandas as pd
 
 from activitysim.core import config, expressions, los, workflow
+from activitysim.core.configuration.base import PreprocessorSettings, PydanticReadable
+from activitysim.core.configuration.logit import LogitComponentSettings
+from activitysim.abm.models.parking_location_choice import ParkingLocationSettings
 
 logger = logging.getLogger(__name__)
+
+
+class MatrixTableSettings(PydanticReadable):
+    name: str
+    data_field: str
+
+
+class MatrixSettings(PydanticReadable):
+    file_name: Path
+    tables: list[MatrixTableSettings] = []
+    is_tap: bool = False
+
+
+class WriteTripMatricesSettings(PydanticReadable):
+    """
+    Settings for the `write_trip_matrices` component.
+    """
+
+    SAVE_TRIPS_TABLE: bool = False
+    """Save trip tables"""
+
+    HH_EXPANSION_WEIGHT_COL: str = "sample_rate"
+    """Column represents the sampling rate of households"""
+
+    MATRICES: list[MatrixSettings] = []
+
+    CONSTANTS: dict[str, Any] = {}
+
+    preprocessor: PreprocessorSettings | None = None
 
 
 @workflow.step(copy_tables=["trips"])
@@ -18,6 +52,8 @@ def write_trip_matrices(
     state: workflow.State,
     network_los: los.Network_LOS,
     trips: pd.DataFrame,
+    model_settings: WriteTripMatricesSettings | None = None,
+    model_settings_file_name: str = "write_trip_matrices.yaml",
 ) -> None:
     """
     Write trip matrices step.
@@ -46,23 +82,47 @@ def write_trip_matrices(
         )
         return
 
-    model_settings = state.filesystem.read_model_settings("write_trip_matrices.yaml")
+    if model_settings is None:
+        model_settings = WriteTripMatricesSettings.read_settings_file(
+            state.filesystem,
+            model_settings_file_name,
+        )
+
     trips_df = annotate_trips(state, trips, network_los, model_settings)
 
-    if bool(model_settings.get("SAVE_TRIPS_TABLE")):
+    if model_settings.SAVE_TRIPS_TABLE:
         state.add_table("trips", trips_df)
 
     if "parking_location" in state.settings.models:
-        parking_settings = state.filesystem.read_model_settings(
-            "parking_location_choice.yaml"
+        parking_settings = ParkingLocationSettings.read_settings_file(
+            state.filesystem,
+            "parking_location_choice.yaml",
         )
-        parking_taz_col_name = parking_settings["ALT_DEST_COL_NAME"]
+        parking_taz_col_name = parking_settings.ALT_DEST_COL_NAME
+        if ~(trips_df["trip_mode"].isin(parking_settings.AUTO_MODES)).any():
+            logger.warning(
+                f"Parking location choice model is enabled, but none of {parking_settings.AUTO_MODES} auto modes found in trips table."
+                "See AUTO_MODES setting in parking_location_choice.yaml."
+            )
+
         if parking_taz_col_name in trips_df:
-            # TODO make parking zone negative, not zero, if not used
+            trips_df["true_origin"] = trips_df["origin"]
+            trips_df["true_destination"] = trips_df["destination"]
+
+            # Get origin parking zone if vehicle not parked at origin
+            trips_df["origin_parking_zone"] = np.where(
+                (trips_df["tour_id"] == trips_df["tour_id"].shift(1))
+                & trips_df["trip_mode"].isin(parking_settings.AUTO_MODES),
+                trips_df[parking_taz_col_name].shift(1),
+                -1,
+            )
+
             trips_df.loc[trips_df[parking_taz_col_name] > 0, "destination"] = trips_df[
                 parking_taz_col_name
             ]
-        # Also need address the return trip
+            trips_df.loc[trips_df["origin_parking_zone"] > 0, "origin"] = trips_df[
+                "origin_parking_zone"
+            ]
 
     # write matrices by zone system type
     if network_los.zone_system == los.ONE_ZONE:  # taz trips written to taz matrices
@@ -72,7 +132,7 @@ def write_trip_matrices(
         )
 
         # use the average household weight for all trips in the origin destination pair
-        hh_weight_col = model_settings.get("HH_EXPANSION_WEIGHT_COL")
+        hh_weight_col = model_settings.HH_EXPANSION_WEIGHT_COL
         aggregate_weight = (
             trips_df[["origin", "destination", hh_weight_col]]
             .groupby(["origin", "destination"], sort=False)
@@ -116,7 +176,7 @@ def write_trip_matrices(
         )
 
         # use the average household weight for all trips in the origin destination pair
-        hh_weight_col = model_settings.get("HH_EXPANSION_WEIGHT_COL")
+        hh_weight_col = model_settings.HH_EXPANSION_WEIGHT_COL
         aggregate_weight = (
             trips_df[["otaz", "dtaz", hh_weight_col]]
             .groupby(["otaz", "dtaz"], sort=False)
@@ -164,7 +224,7 @@ def write_trip_matrices(
         )
 
         # use the average household weight for all trips in the origin destination pair
-        hh_weight_col = model_settings.get("HH_EXPANSION_WEIGHT_COL")
+        hh_weight_col = model_settings.HH_EXPANSION_WEIGHT_COL
         aggregate_weight = (
             trips_df[["otaz", "dtaz", hh_weight_col]]
             .groupby(["otaz", "dtaz"], sort=False)
@@ -201,7 +261,7 @@ def write_trip_matrices(
         )
 
         # use the average household weight for all trips in the origin destination pair
-        hh_weight_col = model_settings.get("HH_EXPANSION_WEIGHT_COL")
+        hh_weight_col = model_settings.HH_EXPANSION_WEIGHT_COL
         aggregate_weight = (
             trips_df[["btap", "atap", hh_weight_col]]
             .groupby(["btap", "atap"], sort=False)
@@ -229,10 +289,30 @@ def write_trip_matrices(
             True,
         )
 
+    if "parking_location" in state.settings.models:
+        # Set trip origin and destination to be the actual location the person is and not where their vehicle is parked
+        trips_df["origin"] = trips_df["true_origin"]
+        trips_df["destination"] = trips_df["true_destination"]
+        del trips_df["true_origin"], trips_df["true_destination"]
+        if (
+            network_los.zone_system == los.TWO_ZONE
+            or network_los.zone_system == los.THREE_ZONE
+        ):
+            trips_df["otaz"] = (
+                state.get_table("land_use").reindex(trips_df["origin"]).TAZ.tolist()
+            )
+            trips_df["dtaz"] = (
+                state.get_table("land_use")
+                .reindex(trips_df["destination"])
+                .TAZ.tolist()
+            )
 
-@workflow.func
+
 def annotate_trips(
-    state: workflow.State, trips: pd.DataFrame, network_los, model_settings
+    state: workflow.State,
+    trips: pd.DataFrame,
+    network_los,
+    model_settings: WriteTripMatricesSettings,
 ):
     """
     Add columns to local trips table. The annotator has
@@ -277,7 +357,7 @@ def annotate_trips(
 
     # Data will be expanded by an expansion weight column from
     # the households pipeline table, if specified in the model settings.
-    hh_weight_col = model_settings.get("HH_EXPANSION_WEIGHT_COL")
+    hh_weight_col = model_settings.HH_EXPANSION_WEIGHT_COL
 
     if hh_weight_col and hh_weight_col not in trips_df:
         logger.info("adding '%s' from households to trips table" % hh_weight_col)
@@ -293,7 +373,7 @@ def write_matrices(
     zone_index,
     orig_index,
     dest_index,
-    model_settings,
+    model_settings: WriteTripMatricesSettings,
     is_tap=False,
 ):
     """
@@ -308,30 +388,30 @@ def write_matrices(
     but the table 'data_field's must be summable types: ints, floats, bools.
     """
 
-    matrix_settings = model_settings.get("MATRICES")
+    matrix_settings = model_settings.MATRICES
 
     if not matrix_settings:
         logger.error("Missing MATRICES setting in write_trip_matrices.yaml")
 
     for matrix in matrix_settings:
-        matrix_is_tap = matrix.get("is_tap", False)
+        matrix_is_tap = matrix.is_tap
 
         if matrix_is_tap == is_tap:  # only write tap matrices to tap matrix files
-            filename = matrix.get("file_name")
+            filename = str(matrix.file_name)
             filepath = state.get_output_file_path(filename)
             logger.info("opening %s" % filepath)
             file = omx.open_file(str(filepath), "w")  # possibly overwrite existing file
-            table_settings = matrix.get("tables")
+            table_settings = matrix.tables
 
             for table in table_settings:
-                table_name = table.get("name")
-                col = table.get("data_field")
+                table_name = table.name
+                col = table.data_field
 
                 if col not in aggregate_trips:
                     logger.error(f"missing {col} column in aggregate_trips DataFrame")
                     return
 
-                hh_weight_col = model_settings.get("HH_EXPANSION_WEIGHT_COL")
+                hh_weight_col = model_settings.HH_EXPANSION_WEIGHT_COL
                 if hh_weight_col:
                     aggregate_trips[col] = (
                         aggregate_trips[col] / aggregate_trips[hh_weight_col]

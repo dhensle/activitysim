@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Mapping
+from collections.abc import Mapping
 
 import numpy as np
 import pandas as pd
@@ -13,7 +13,14 @@ from activitysim.abm.models.util.trip import (
     get_time_windows,
 )
 from activitysim.core import chunk, expressions, simulate, tracing, workflow
+from activitysim.core.configuration.base import (
+    ComputeSettings,
+    PreprocessorSettings,
+    PydanticReadable,
+)
 from activitysim.core.interaction_sample_simulate import _interaction_sample_simulate
+from activitysim.core.skim_dataset import SkimDataset
+from activitysim.core.skim_dictionary import SkimDict
 
 logger = logging.getLogger(__name__)
 
@@ -64,9 +71,7 @@ def generate_schedule_alternatives(tours):
             stops.
     :return: pd.Dataframe: Potential time duration windows.
     """
-    assert set([NUM_IB_STOPS, NUM_OB_STOPS, TOUR_DURATION_COLUMN]).issubset(
-        tours.columns
-    )
+    assert {NUM_IB_STOPS, NUM_OB_STOPS, TOUR_DURATION_COLUMN}.issubset(tours.columns)
 
     stop_pattern = tours[HAS_OB_STOPS].astype(int) + tours[HAS_IB_STOPS].astype(int)
 
@@ -192,16 +197,19 @@ def get_pattern_index_and_arrays(tour_indexes, durations, one_way=True):
     return indexes, patterns, pattern_sizes
 
 
-def get_spec_for_segment(state: workflow.State, model_settings, spec_name, segment):
+def get_spec_for_segment(
+    state: workflow.State, model_settings: TripSchedulingChoiceSettings, segment: str
+):
     """
     Read in the model spec
     :param model_settings: model settings file
-    :param spec_name: name of the key in the settings file
     :param segment: which segment of the spec file do you want to read
     :return: array of utility equations
     """
 
-    omnibus_spec = state.filesystem.read_model_spec(file_name=model_settings[spec_name])
+    omnibus_spec = state.filesystem.read_model_spec(
+        file_name=model_settings.SPECIFICATION
+    )
 
     spec = omnibus_spec[[segment]]
 
@@ -219,6 +227,7 @@ def run_trip_scheduling_choice(
     skims,
     locals_dict: Mapping,
     trace_label: str,
+    model_settings: TripSchedulingChoiceSettings,
 ):
     NUM_TOUR_LEGS = 3
     trace_label = tracing.extend_trace_label(trace_label, "interaction_sample_simulate")
@@ -292,6 +301,7 @@ def run_trip_scheduling_choice(
                 trace_choice_name="trip_schedule_stage_1",
                 estimator=None,
                 chunk_sizer=chunk_sizer,
+                compute_settings=model_settings.compute_settings,
             )
 
             assert len(choices.index) == len(choosers.index)
@@ -300,7 +310,7 @@ def run_trip_scheduling_choice(
 
             result_list.append(choices)
 
-            chunk_sizer.log_df(trace_label, f"result_list", result_list)
+            chunk_sizer.log_df(trace_label, "result_list", result_list)
 
         # FIXME: this will require 2X RAM
         # if necessary, could append to hdf5 store on disk:
@@ -323,16 +333,39 @@ def run_trip_scheduling_choice(
     return tours
 
 
+class TripSchedulingChoiceSettings(PydanticReadable, extra="forbid"):
+    """
+    Settings for the `trip_scheduling_choice` component.
+    """
+
+    PREPROCESSOR: PreprocessorSettings | None = None
+    """Setting for the preprocessor."""
+
+    SPECIFICATION: str
+    """file name of specification file"""
+
+    compute_settings: ComputeSettings = ComputeSettings()
+    """Compute settings for this component."""
+
+
 @workflow.step
 def trip_scheduling_choice(
     state: workflow.State,
     trips: pd.DataFrame,
     tours: pd.DataFrame,
-    skim_dict,
+    skim_dict: SkimDict | SkimDataset,
+    model_settings: TripSchedulingChoiceSettings | None = None,
+    model_settings_file_name: str = "trip_scheduling_choice.yaml",
+    trace_label: str = "trip_scheduling_choice",
 ) -> None:
-    trace_label = "trip_scheduling_choice"
-    model_settings = state.filesystem.read_model_settings("trip_scheduling_choice.yaml")
-    spec = get_spec_for_segment(state, model_settings, "SPECIFICATION", "stage_one")
+
+    if model_settings is None:
+        model_settings = TripSchedulingChoiceSettings.read_settings_file(
+            state.filesystem,
+            model_settings_file_name,
+        )
+
+    spec = get_spec_for_segment(state, model_settings, "stage_one")
 
     trips_df = trips
     tours_df = tours
@@ -364,7 +397,7 @@ def trip_scheduling_choice(
         .reindex(tours.index)
     )
 
-    preprocessor_settings = model_settings.get("PREPROCESSOR", None)
+    preprocessor_settings = model_settings.PREPROCESSOR
 
     # hack: preprocessor adds origin column in place if it does not exist already
     od_skim_stack_wrapper = skim_dict.wrap("origin", "destination")
@@ -395,7 +428,13 @@ def trip_scheduling_choice(
         )
 
     tours_df = run_trip_scheduling_choice(
-        state, spec, tours_df, skims, locals_dict, trace_label
+        state,
+        spec,
+        tours_df,
+        skims,
+        locals_dict,
+        trace_label,
+        model_settings,
     )
 
     state.add_table("tours", tours_df)

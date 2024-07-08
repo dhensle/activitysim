@@ -8,6 +8,8 @@ import warnings
 from collections import OrderedDict
 from collections.abc import Callable
 from datetime import timedelta
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -22,6 +24,12 @@ from activitysim.core import (
     tracing,
     util,
     workflow,
+)
+from activitysim.core.configuration.base import ComputeSettings, PydanticBase
+from activitysim.core.configuration.logit import (
+    BaseLogitComponentSettings,
+    LogitNestSpec,
+    TemplatedLogitComponentSettings,
 )
 from activitysim.core.estimation import Estimator
 from activitysim.core.simulate_consts import (
@@ -49,7 +57,7 @@ def random_rows(state: workflow.State, df, n):
         return df
 
 
-def uniquify_spec_index(spec):
+def uniquify_spec_index(spec: pd.DataFrame):
     # uniquify spec index inplace
     # ensure uniqueness of spec index by appending comment with dupe count
     # this allows us to use pandas dot to compute_utilities
@@ -72,7 +80,7 @@ def read_model_alts(state: workflow.State, file_name, set_index=None):
     return df
 
 
-def read_model_spec(filesystem: configuration.FileSystem, file_name: str):
+def read_model_spec(filesystem: configuration.FileSystem, file_name: Path | str):
     """
     Read a CSV model specification into a Pandas DataFrame or Series.
 
@@ -103,7 +111,8 @@ def read_model_spec(filesystem: configuration.FileSystem, file_name: str):
         The description column is dropped from the returned data and the
         expression values are set as the table index.
     """
-
+    if isinstance(file_name, Path):
+        file_name = str(file_name)
     assert isinstance(file_name, str)
     if not file_name.lower().endswith(".csv"):
         file_name = f"{file_name}.csv"
@@ -137,8 +146,10 @@ def read_model_spec(filesystem: configuration.FileSystem, file_name: str):
 
 
 def read_model_coefficients(
-    filesystem: configuration.FileSystem, model_settings=None, file_name=None
-):
+    filesystem: configuration.FileSystem,
+    model_settings: BaseLogitComponentSettings | dict[str, Any] | None = None,
+    file_name: Path | str | None = None,
+) -> pd.DataFrame:
     """
     Read the coefficient file specified by COEFFICIENTS model setting
     """
@@ -148,12 +159,18 @@ def read_model_coefficients(
         assert file_name is not None
     else:
         assert file_name is None
-        assert (
-            "COEFFICIENTS" in model_settings
-        ), "'COEFFICIENTS' tag not in model_settings in %s" % model_settings.get(
-            "source_file_paths"
-        )
-        file_name = model_settings["COEFFICIENTS"]
+        if isinstance(model_settings, BaseLogitComponentSettings) or (
+            isinstance(model_settings, PydanticBase)
+            and hasattr(model_settings, "COEFFICIENTS")
+        ):
+            file_name = model_settings.COEFFICIENTS
+        else:
+            assert (
+                "COEFFICIENTS" in model_settings
+            ), "'COEFFICIENTS' tag not in model_settings in %s" % model_settings.get(
+                "source_file_paths"
+            )
+            file_name = model_settings["COEFFICIENTS"]
         logger.debug(f"read_model_coefficients file_name {file_name}")
 
     file_path = filesystem.get_config_file_path(file_name)
@@ -179,13 +196,15 @@ def read_model_coefficients(
     return coefficients
 
 
-@workflow.func
 def spec_for_segment(
     state: workflow.State,
-    model_settings,
+    model_settings: dict | None,
     spec_id: str,
     segment_name: str,
     estimator: Estimator | None,
+    *,
+    spec_file_name: Path | None = None,
+    coefficients_file_name: Path | None = None,
 ) -> pd.DataFrame:
     """
     Select spec for specified segment from omnibus spec containing columns for each segment
@@ -203,7 +222,8 @@ def spec_for_segment(
         canonical spec file with expressions in index and single column with utility coefficients
     """
 
-    spec_file_name = model_settings[spec_id]
+    if spec_file_name is None:
+        spec_file_name = model_settings[spec_id]
     spec = read_model_spec(state.filesystem, file_name=spec_file_name)
 
     if len(spec.columns) > 1:
@@ -214,7 +234,14 @@ def spec_for_segment(
         # doesn't really matter what it is called, but this may catch errors
         assert spec.columns[0] in ["coefficient", segment_name]
 
-    if "COEFFICIENTS" not in model_settings:
+    if (
+        coefficients_file_name is None
+        and isinstance(model_settings, dict)
+        and "COEFFICIENTS" in model_settings
+    ):
+        coefficients_file_name = model_settings["COEFFICIENTS"]
+
+    if coefficients_file_name is None:
         logger.warning(
             f"no coefficient file specified in model_settings for {spec_file_name}"
         )
@@ -224,11 +251,13 @@ def spec_for_segment(
             raise RuntimeError(
                 f"No coefficient file specified for {spec_file_name} "
                 f"but not all spec column values are numeric"
-            )
+            ) from None
 
         return spec
 
-    coefficients = state.filesystem.read_model_coefficients(model_settings)
+    coefficients = read_model_coefficients(
+        state.filesystem, file_name=coefficients_file_name
+    )
 
     spec = eval_coefficients(state, spec, coefficients, estimator)
 
@@ -236,19 +265,22 @@ def spec_for_segment(
 
 
 def read_model_coefficient_template(
-    filesystem: configuration.FileSystem, model_settings
+    filesystem: configuration.FileSystem,
+    model_settings: dict | TemplatedLogitComponentSettings,
 ):
     """
     Read the coefficient template specified by COEFFICIENT_TEMPLATE model setting
     """
 
-    assert (
-        "COEFFICIENT_TEMPLATE" in model_settings
-    ), "'COEFFICIENT_TEMPLATE' not in model_settings in %s" % model_settings.get(
-        "source_file_paths"
-    )
-
-    coefficients_file_name = model_settings["COEFFICIENT_TEMPLATE"]
+    if isinstance(model_settings, dict):
+        assert (
+            "COEFFICIENT_TEMPLATE" in model_settings
+        ), "'COEFFICIENT_TEMPLATE' not in model_settings in %s" % model_settings.get(
+            "source_file_paths"
+        )
+        coefficients_file_name = model_settings["COEFFICIENT_TEMPLATE"]
+    else:
+        coefficients_file_name = model_settings.COEFFICIENT_TEMPLATE
 
     file_path = filesystem.get_config_file_path(coefficients_file_name)
     try:
@@ -300,7 +332,9 @@ def dump_mapped_coefficients(state: workflow.State, model_settings):
 
 
 def get_segment_coefficients(
-    filesystem: configuration.FileSystem, model_settings, segment_name
+    filesystem: configuration.FileSystem,
+    model_settings: PydanticBase | dict,
+    segment_name: str,
 ):
     """
     Return a dict mapping generic coefficient names to segment-specific coefficient values
@@ -332,10 +366,19 @@ def get_segment_coefficients(
         ...
 
     """
+    if isinstance(model_settings, PydanticBase):
+        model_settings = model_settings.dict()
 
-    if "COEFFICIENTS" in model_settings and "COEFFICIENT_TEMPLATE" in model_settings:
+    if (
+        "COEFFICIENTS" in model_settings
+        and "COEFFICIENT_TEMPLATE" in model_settings
+        and model_settings["COEFFICIENTS"] is not None
+        and model_settings["COEFFICIENT_TEMPLATE"] is not None
+    ):
         legacy = False
-    elif "COEFFICIENTS" in model_settings:
+    elif (
+        "COEFFICIENTS" in model_settings and model_settings["COEFFICIENTS"] is not None
+    ):
         legacy = "COEFFICIENTS"
         warnings.warn(
             "Support for COEFFICIENTS without COEFFICIENT_TEMPLATE in model settings file will be removed."
@@ -360,9 +403,17 @@ def get_segment_coefficients(
         omnibus_coefficients = pd.read_csv(
             legacy_coeffs_file_path, comment="#", index_col="coefficient_name"
         )
+        try:
+            omnibus_coefficients_segment_name = omnibus_coefficients[segment_name]
+        except KeyError:
+            logger.error(f"No key {segment_name} found!")
+            possible_keys = "\n- ".join(omnibus_coefficients.keys())
+            logger.error(f"possible keys include: \n- {possible_keys}")
+            raise
         coefficients_dict = assign.evaluate_constants(
-            omnibus_coefficients[segment_name], constants=constants
+            omnibus_coefficients_segment_name, constants=constants
         )
+
     else:
         coefficients_df = filesystem.read_model_coefficients(model_settings)
         template_df = read_model_coefficient_template(filesystem, model_settings)
@@ -383,25 +434,40 @@ def get_segment_coefficients(
     return coefficients_dict
 
 
-def eval_nest_coefficients(nest_spec, coefficients, trace_label):
-    def replace_coefficients(nest):
+def eval_nest_coefficients(
+    nest_spec: LogitNestSpec | dict, coefficients: dict, trace_label: str
+) -> LogitNestSpec:
+    def replace_coefficients(nest: LogitNestSpec):
         if isinstance(nest, dict):
             assert "coefficient" in nest
             coefficient_name = nest["coefficient"]
             if isinstance(coefficient_name, str):
                 assert (
                     coefficient_name in coefficients
-                ), "%s not in nest coefficients" % (coefficient_name,)
+                ), f"{coefficient_name} not in nest coefficients"
                 nest["coefficient"] = coefficients[coefficient_name]
 
             assert "alternatives" in nest
             for alternative in nest["alternatives"]:
-                if isinstance(alternative, dict):
+                if isinstance(alternative, dict | LogitNestSpec):
+                    replace_coefficients(alternative)
+        elif isinstance(nest, LogitNestSpec):
+            if isinstance(nest.coefficient, str):
+                assert (
+                    nest.coefficient in coefficients
+                ), f"{nest.coefficient} not in nest coefficients"
+                nest.coefficient = coefficients[nest.coefficient]
+
+            for alternative in nest.alternatives:
+                if isinstance(alternative, dict | LogitNestSpec):
                     replace_coefficients(alternative)
 
     if isinstance(coefficients, pd.DataFrame):
         assert "value" in coefficients.columns
         coefficients = coefficients["value"].to_dict()
+
+    if not isinstance(nest_spec, LogitNestSpec):
+        nest_spec = LogitNestSpec.model_validate(nest_spec)
 
     replace_coefficients(nest_spec)
 
@@ -443,9 +509,9 @@ def eval_coefficients(
     zero_rows = (spec == 0).all(axis=1)
     if zero_rows.any():
         if estimator:
-            logger.debug("keeping %s all-zero rows in SPEC" % (zero_rows.sum(),))
+            logger.debug(f"keeping {zero_rows.sum()} all-zero rows in SPEC")
         else:
-            logger.debug("dropping %s all-zero rows from SPEC" % (zero_rows.sum(),))
+            logger.debug(f"dropping {zero_rows.sum()} all-zero rows from SPEC")
             spec = spec.loc[~zero_rows]
 
     return spec
@@ -466,6 +532,7 @@ def eval_utilities(
     spec_sh=None,
     *,
     chunk_sizer,
+    compute_settings: ComputeSettings | None = None,
 ):
     """
     Evaluate a utility function as defined in a spec file.
@@ -505,6 +572,8 @@ def eval_utilities(
         This is meant to give the same result, but allows for some optimizations
         or preprocessing outside the sharrow framework (e.g. to run the Python
         based transit virtual path builder and cache relevant values).
+    compute_settings : ComputeSettings, optional
+        Settings for sharrow. If not given, the default settings are used.
 
     Returns
     -------
@@ -526,7 +595,9 @@ def eval_utilities(
     if spec_sh is None:
         spec_sh = spec
 
-    if locals_d is not None and "disable_sharrow" in locals_d:
+    if compute_settings is None:
+        compute_settings = ComputeSettings()
+    if compute_settings.sharrow_skip:
         sharrow_enabled = False
 
     if sharrow_enabled:
@@ -544,6 +615,7 @@ def eval_utilities(
             trace_label,
             sharrow_enabled == "require",
             zone_layer=zone_layer,
+            compute_settings=compute_settings,
         )
         utilities = sh_util
         timelogger.mark("sharrow flow", True, logger, trace_label)
@@ -575,42 +647,43 @@ def eval_utilities(
         chunk_sizer.log_df(trace_label, "expression_values", expression_values)
 
         i = 0
-        for expr, coefficients in zip(exprs, spec.values):
-            try:
-                with warnings.catch_warnings(record=True) as w:
-                    # Cause all warnings to always be triggered.
-                    warnings.simplefilter("always")
-                    if expr.startswith("@"):
-                        expression_value = eval(expr[1:], globals_dict, locals_dict)
-                    else:
-                        expression_value = choosers.eval(expr)
+        with compute_settings.pandas_option_context():
+            for expr, coefficients in zip(exprs, spec.values):
+                try:
+                    with warnings.catch_warnings(record=True) as w:
+                        # Cause all warnings to always be triggered.
+                        warnings.simplefilter("always")
+                        if expr.startswith("@"):
+                            expression_value = eval(expr[1:], globals_dict, locals_dict)
+                        else:
+                            expression_value = choosers.eval(expr)
 
-                    if len(w) > 0:
-                        for wrn in w:
-                            logger.warning(
-                                f"{trace_label} - {type(wrn).__name__} ({wrn.message}) evaluating: {str(expr)}"
-                            )
+                        if len(w) > 0:
+                            for wrn in w:
+                                logger.warning(
+                                    f"{trace_label} - {type(wrn).__name__} ({wrn.message}) evaluating: {str(expr)}"
+                                )
 
-            except Exception as err:
-                logger.exception(
-                    f"{trace_label} - {type(err).__name__} ({str(err)}) evaluating: {str(expr)}"
-                )
-                raise err
-
-            if log_alt_losers:
-                # utils for each alt for this expression
-                # FIXME if we always did tis, we cold uem these and skip np.dot below
-                utils = np.outer(expression_value, coefficients)
-                losers = np.amax(utils, axis=1) < ALT_LOSER_UTIL
-
-                if losers.any():
-                    logger.warning(
-                        f"{trace_label} - {sum(losers)} choosers of {len(losers)} "
-                        f"with prohibitive utilities for all alternatives for expression: {expr}"
+                except Exception as err:
+                    logger.exception(
+                        f"{trace_label} - {type(err).__name__} ({str(err)}) evaluating: {str(expr)}"
                     )
+                    raise err
 
-            expression_values[i] = expression_value
-            i += 1
+                if log_alt_losers:
+                    # utils for each alt for this expression
+                    # FIXME if we always did tis, we cold uem these and skip np.dot below
+                    utils = np.outer(expression_value, coefficients)
+                    losers = np.amax(utils, axis=1) < ALT_LOSER_UTIL
+
+                    if losers.any():
+                        logger.warning(
+                            f"{trace_label} - {sum(losers)} choosers of {len(losers)} "
+                            f"with prohibitive utilities for all alternatives for expression: {expr}"
+                        )
+
+                expression_values[i] = expression_value
+                i += 1
 
         chunk_sizer.log_df(trace_label, "expression_values", expression_values)
 
@@ -723,7 +796,7 @@ def eval_utilities(
             misses = np.where(~np.isclose(sh_util, utilities.values, rtol=1e-2, atol=0))
             _sh_util_miss1 = sh_util[tuple(m[0] for m in misses)]
             _u_miss1 = utilities.values[tuple(m[0] for m in misses)]
-            diff = _sh_util_miss1 - _u_miss1
+            _sh_util_miss1 - _u_miss1
             if len(misses[0]) > sh_util.size * 0.01:
                 print(
                     f"big problem: {len(misses[0])} missed close values "
@@ -1091,6 +1164,7 @@ def eval_mnl(
     trace_column_names=None,
     *,
     chunk_sizer,
+    compute_settings: ComputeSettings | None = None,
 ):
     """
     Run a simulation for when the model spec does not involve alternative
@@ -1154,6 +1228,7 @@ def eval_mnl(
         estimator=estimator,
         trace_column_names=trace_column_names,
         chunk_sizer=chunk_sizer,
+        compute_settings=compute_settings,
     )
     chunk_sizer.log_df(trace_label, "utilities", utilities)
 
@@ -1212,6 +1287,7 @@ def eval_nl(
     trace_column_names=None,
     *,
     chunk_sizer: chunk.ChunkSizer,
+    compute_settings: ComputeSettings | None = None,
 ):
     """
     Run a nested-logit simulation for when the model spec does not involve alternative
@@ -1242,6 +1318,8 @@ def eval_nl(
         This is the column label to be used in trace file csv dump of choices
     trace_column_names: str or list of str
         chooser columns to include when tracing expression_values
+    fastmath : bool, default True
+        Use fastmath for sharrow compiled code.
 
     Returns
     -------
@@ -1273,6 +1351,7 @@ def eval_nl(
         trace_column_names=trace_column_names,
         spec_sh=spec_sh,
         chunk_sizer=chunk_sizer,
+        compute_settings=compute_settings,
     )
     chunk_sizer.log_df(trace_label, "raw_utilities", raw_utilities)
 
@@ -1399,6 +1478,7 @@ def _simple_simulate(
     trace_column_names=None,
     *,
     chunk_sizer,
+    compute_settings: ComputeSettings | None = None,
 ):
     """
     Run an MNL or NL simulation for when the model spec does not involve alternative
@@ -1448,6 +1528,31 @@ def _simple_simulate(
     if skims is not None:
         set_skim_wrapper_targets(choosers, skims)
 
+    # check if tracing is enabled and if we have trace targets
+    have_trace_targets = state.tracing.has_trace_targets(choosers)
+
+    sharrow_enabled = state.settings.sharrow
+
+    if compute_settings is None:
+        compute_settings = ComputeSettings()
+
+    # if tracing is not enabled, drop unused columns
+    # if not estimation mode, drop unused columns
+    if (
+        (not have_trace_targets)
+        and (estimator is None)
+        and (compute_settings.drop_unused_columns)
+    ):
+        # drop unused variables in chooser table
+        choosers = util.drop_unused_columns(
+            choosers,
+            spec,
+            locals_d,
+            custom_chooser,
+            sharrow_enabled=sharrow_enabled,
+            additional_columns=compute_settings.protect_columns,
+        )
+
     if nest_spec is None:
         choices = eval_mnl(
             state,
@@ -1462,6 +1567,7 @@ def _simple_simulate(
             trace_choice_name=trace_choice_name,
             trace_column_names=trace_column_names,
             chunk_sizer=chunk_sizer,
+            compute_settings=compute_settings,
         )
     else:
         choices = eval_nl(
@@ -1478,6 +1584,7 @@ def _simple_simulate(
             trace_choice_name=trace_choice_name,
             trace_column_names=trace_column_names,
             chunk_sizer=chunk_sizer,
+            compute_settings=compute_settings,
         )
 
     return choices
@@ -1516,6 +1623,7 @@ def simple_simulate(
     trace_label=None,
     trace_choice_name=None,
     trace_column_names=None,
+    compute_settings: ComputeSettings | None = None,
 ):
     """
     Run an MNL or NL simulation for when the model spec does not involve alternative
@@ -1530,7 +1638,7 @@ def simple_simulate(
     result_list = []
     # segment by person type and pick the right spec for each person type
     for (
-        i,
+        _i,
         chooser_chunk,
         chunk_trace_label,
         chunk_sizer,
@@ -1550,6 +1658,7 @@ def simple_simulate(
             trace_choice_name=trace_choice_name,
             trace_column_names=trace_column_names,
             chunk_sizer=chunk_sizer,
+            compute_settings=compute_settings,
         )
 
         result_list.append(choices)
@@ -1577,6 +1686,7 @@ def simple_simulate_by_chunk_id(
     estimator=None,
     trace_label=None,
     trace_choice_name=None,
+    compute_settings: ComputeSettings | None = None,
 ):
     """
     chunk_by_chunk_id wrapper for simple_simulate
@@ -1584,7 +1694,7 @@ def simple_simulate_by_chunk_id(
     choices = None
     result_list = []
     for (
-        i,
+        _i,
         chooser_chunk,
         chunk_trace_label,
         chunk_sizer,
@@ -1603,6 +1713,7 @@ def simple_simulate_by_chunk_id(
             trace_label=chunk_trace_label,
             trace_choice_name=trace_choice_name,
             chunk_sizer=chunk_sizer,
+            compute_settings=compute_settings,
         )
 
         result_list.append(choices)
@@ -1616,7 +1727,14 @@ def simple_simulate_by_chunk_id(
 
 
 def eval_mnl_logsums(
-    state: workflow.State, choosers, spec, locals_d, trace_label=None, *, chunk_sizer
+    state: workflow.State,
+    choosers,
+    spec,
+    locals_d,
+    trace_label=None,
+    *,
+    chunk_sizer,
+    compute_settings: ComputeSettings | None = None,
 ):
     """
     like eval_nl except return logsums instead of making choices
@@ -1646,6 +1764,7 @@ def eval_mnl_logsums(
         trace_label,
         have_trace_targets,
         chunk_sizer=chunk_sizer,
+        compute_settings=compute_settings,
     )
     chunk_sizer.log_df(trace_label, "utilities", utilities)
 
@@ -1759,6 +1878,7 @@ def eval_nl_logsums(
     trace_label=None,
     *,
     chunk_sizer: chunk.ChunkSizer,
+    compute_settings: ComputeSettings | None = None,
 ):
     """
     like eval_nl except return logsums instead of making choices
@@ -1789,6 +1909,7 @@ def eval_nl_logsums(
         have_trace_targets=have_trace_targets,
         spec_sh=spec_sh,
         chunk_sizer=chunk_sizer,
+        compute_settings=compute_settings,
     )
     chunk_sizer.log_df(trace_label, "raw_utilities", raw_utilities)
 
@@ -1839,6 +1960,7 @@ def _simple_simulate_logsums(
     trace_label=None,
     *,
     chunk_sizer,
+    compute_settings: ComputeSettings | None = None,
 ):
     """
     like simple_simulate except return logsums instead of making choices
@@ -1852,6 +1974,24 @@ def _simple_simulate_logsums(
     if skims is not None:
         set_skim_wrapper_targets(choosers, skims)
 
+    # check if tracing is enabled and if we have trace targets
+    have_trace_targets = state.tracing.has_trace_targets(choosers)
+
+    if compute_settings is None:
+        compute_settings = ComputeSettings()
+
+    # if tracing is not enabled, drop unused columns
+    if (not have_trace_targets) and (compute_settings.drop_unused_columns):
+        # drop unused variables in chooser table
+        choosers = util.drop_unused_columns(
+            choosers,
+            spec,
+            locals_d,
+            custom_chooser=None,
+            sharrow_enabled=state.settings.sharrow,
+            additional_columns=compute_settings.protect_columns,
+        )
+
     if nest_spec is None:
         logsums = eval_mnl_logsums(
             state,
@@ -1860,6 +2000,7 @@ def _simple_simulate_logsums(
             locals_d,
             trace_label=trace_label,
             chunk_sizer=chunk_sizer,
+            compute_settings=compute_settings,
         )
     else:
         logsums = eval_nl_logsums(
@@ -1870,6 +2011,7 @@ def _simple_simulate_logsums(
             locals_d,
             trace_label=trace_label,
             chunk_sizer=chunk_sizer,
+            compute_settings=compute_settings,
         )
 
     return logsums
@@ -1886,6 +2028,8 @@ def simple_simulate_logsums(
     chunk_size=0,
     trace_label=None,
     chunk_tag=None,
+    explicit_chunk_size=0,
+    compute_settings: ComputeSettings | None = None,
 ):
     """
     like simple_simulate except return logsums instead of making choices
@@ -1902,12 +2046,17 @@ def simple_simulate_logsums(
     result_list = []
     # segment by person type and pick the right spec for each person type
     for (
-        i,
+        _i,
         chooser_chunk,
         chunk_trace_label,
         chunk_sizer,
     ) in chunk.adaptive_chunked_choosers(
-        state, choosers, trace_label, chunk_tag, chunk_size=chunk_size
+        state,
+        choosers,
+        trace_label,
+        chunk_tag,
+        chunk_size=chunk_size,
+        explicit_chunk_size=explicit_chunk_size,
     ):
         logsums = _simple_simulate_logsums(
             state,
@@ -1918,6 +2067,7 @@ def simple_simulate_logsums(
             locals_d,
             chunk_trace_label,
             chunk_sizer=chunk_sizer,
+            compute_settings=compute_settings,
         )
 
         result_list.append(logsums)

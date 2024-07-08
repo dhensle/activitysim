@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -18,6 +19,13 @@ from activitysim.core import (
     tracing,
     workflow,
 )
+from activitysim.core.configuration.base import (
+    ComputeSettings,
+    PreprocessorSettings,
+    PydanticCompute,
+)
+from activitysim.core.skim_dataset import SkimDataset
+from activitysim.core.skim_dictionary import SkimDict
 from activitysim.core.util import reindex
 
 logger = logging.getLogger(__name__)
@@ -183,6 +191,7 @@ def choose_tour_leg_pattern(
     trace_label="trace_label",
     *,
     chunk_sizer: chunk.ChunkSizer,
+    compute_settings: ComputeSettings | None = None,
 ):
     alternatives = generate_alternatives(trip_segment, STOP_TIME_DURATION).sort_index()
     have_trace_targets = state.tracing.has_trace_targets(trip_segment)
@@ -229,7 +238,14 @@ def choose_tour_leg_pattern(
         interaction_utilities,
         trace_eval_results,
     ) = interaction_simulate.eval_interaction_utilities(
-        state, spec, interaction_df, None, trace_label, trace_rows, estimator=None
+        state,
+        spec,
+        interaction_df,
+        None,
+        trace_label,
+        trace_rows,
+        estimator=None,
+        compute_settings=compute_settings,
     )
 
     interaction_utilities = pd.concat(
@@ -380,7 +396,14 @@ def choose_tour_leg_pattern(
     return choices
 
 
-def apply_stage_two_model(state, omnibus_spec, trips, chunk_size, trace_label):
+def apply_stage_two_model(
+    state: workflow.State,
+    omnibus_spec,
+    trips,
+    chunk_size,
+    trace_label: str,
+    compute_settings: ComputeSettings | None = None,
+):
     if not trips.index.is_monotonic:
         trips = trips.sort_index()
 
@@ -431,7 +454,7 @@ def apply_stage_two_model(state, omnibus_spec, trips, chunk_size, trace_label):
     trip_list = []
 
     for (
-        i,
+        _i,
         chooser_chunk,
         chunk_trace_label,
         chunk_sizer,
@@ -439,7 +462,7 @@ def apply_stage_two_model(state, omnibus_spec, trips, chunk_size, trace_label):
         for is_outbound, trip_segment in chooser_chunk.groupby(OUTBOUND):
             direction = OUTBOUND if is_outbound else "inbound"
             spec = get_spec_for_segment(omnibus_spec, direction)
-            segment_trace_label = "{}_{}".format(direction, chunk_trace_label)
+            segment_trace_label = f"{direction}_{chunk_trace_label}"
 
             patterns = build_patterns(trip_segment, time_windows)
 
@@ -450,6 +473,7 @@ def apply_stage_two_model(state, omnibus_spec, trips, chunk_size, trace_label):
                 spec,
                 trace_label=segment_trace_label,
                 chunk_sizer=chunk_sizer,
+                compute_settings=compute_settings,
             )
 
             choices = pd.merge(
@@ -477,14 +501,37 @@ def apply_stage_two_model(state, omnibus_spec, trips, chunk_size, trace_label):
     return trips["depart"].astype(int)
 
 
+class TripDepartureChoiceSettings(PydanticCompute, extra="forbid"):
+    """
+    Settings for the `trip_departure_choice` component.
+    """
+
+    PREPROCESSOR: PreprocessorSettings | None = None
+    """Setting for the preprocessor."""
+
+    SPECIFICATION: str = "trip_departure_choice.csv"
+    """Filename for the trip departure choice (.csv) file."""
+
+    CONSTANTS: dict[str, Any] = {}
+
+
 @workflow.step
 def trip_departure_choice(
-    state: workflow.State, trips: pd.DataFrame, trips_merged: pd.DataFrame, skim_dict
+    state: workflow.State,
+    trips: pd.DataFrame,
+    trips_merged: pd.DataFrame,
+    skim_dict: SkimDict | SkimDataset,
+    model_settings: TripDepartureChoiceSettings | None = None,
+    model_settings_file_name: str = "trip_departure_choice.yaml",
+    trace_label: str = "trip_departure_choice",
 ) -> None:
-    trace_label = "trip_departure_choice"
-    model_settings = state.filesystem.read_model_settings("trip_departure_choice.yaml")
+    if model_settings is None:
+        model_settings = TripDepartureChoiceSettings.read_settings_file(
+            state.filesystem,
+            model_settings_file_name,
+        )
 
-    spec = state.filesystem.read_model_spec(file_name=model_settings["SPECIFICATION"])
+    spec = state.filesystem.read_model_spec(file_name=model_settings.SPECIFICATION)
 
     trips_merged_df = trips_merged
     # add tour-based chunk_id so we can chunk all trips in tour together
@@ -500,7 +547,7 @@ def trip_departure_choice(
     )
     locals_d = config.get_model_constants(model_settings).copy()
 
-    preprocessor_settings = model_settings.get("PREPROCESSOR", None)
+    preprocessor_settings = model_settings.PREPROCESSOR
     tour_legs = get_tour_legs(trips_merged_df)
     state.get_rn_generator().add_channel("tour_legs", tour_legs)
 
@@ -528,7 +575,12 @@ def trip_departure_choice(
         )
 
     choices = apply_stage_two_model(
-        state, spec, trips_merged_df, state.settings.chunk_size, trace_label
+        state,
+        spec,
+        trips_merged_df,
+        state.settings.chunk_size,
+        trace_label,
+        compute_settings=model_settings.compute_settings,
     )
 
     trips_df = trips
