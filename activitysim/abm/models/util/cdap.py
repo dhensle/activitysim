@@ -1290,13 +1290,6 @@ def _run_cdap(
             lambda x: 1 if "J" in x else 0
         )
 
-    # return household joint tour flag
-    if add_joint_tour_utility:
-        hh_activity_choices = hh_activity_choices.to_frame(name="hh_choices")
-        hh_activity_choices["has_joint_tour"] = hh_activity_choices["hh_choices"].apply(
-            lambda x: 1 if "J" in x else 0
-        )
-
     # if DUMP:
     #     state.tracing.trace_df(hh_activity_choices, '%s.DUMP.hh_activity_choices' % trace_label,
     #                      transpose=False, slicer='NONE')
