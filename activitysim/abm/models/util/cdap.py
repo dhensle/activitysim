@@ -344,12 +344,6 @@ def cache_joint_spec(state: workflow.State, hhsize, spec):
     state.add_injectable(spec_name, spec)
 
 
-def cache_joint_spec(hhsize, spec):
-    spec_name = cached_joint_spec_name(hhsize)
-    # cache as injectable
-    inject.add_injectable(spec_name, spec)
-
-
 def build_cdap_spec(
     state: workflow.State,
     interaction_coefficients,
