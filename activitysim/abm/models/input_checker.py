@@ -419,9 +419,7 @@ def input_checker(state: workflow.State):
                 pydantic_lists,
             )
 
-    input_check_failure = report_errors(
-        input_checker_settings, v_warnings, v_errors
-    )
+    input_check_failure = report_errors(input_checker_settings, v_warnings, v_errors)
 
     # free memory from input checker tables
     for key, value in TABLE_STORE.items():
