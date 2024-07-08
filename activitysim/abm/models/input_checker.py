@@ -101,7 +101,7 @@ def validate_with_pandera(
     validator_class = getattr(input_checker, validation_settings["class"])
 
     with warnings.catch_warnings(record=True) as caught_warnings:
-        warnings.simplefilter("always")
+        warnings.simplefilter("ignore", category=DeprecationWarning)
         try:
             validator_class.validate(TABLE_STORE[table_name], lazy=True)
         except pa.errors.SchemaErrors as e:
@@ -208,7 +208,7 @@ def validate_with_pydantic(
     return v_errors, v_warnings, pydantic_lists
 
 
-def report_errors(state, input_checker_settings, v_warnings, v_errors):
+def report_errors(input_checker_settings, v_warnings, v_errors):
 
     # logging overall statistics first before printing details
     for table_settings in input_checker_settings["table_list"]:
@@ -420,7 +420,7 @@ def input_checker(state: workflow.State):
             )
 
     input_check_failure = report_errors(
-        state, input_checker_settings, v_warnings, v_errors
+        input_checker_settings, v_warnings, v_errors
     )
 
     # free memory from input checker tables
