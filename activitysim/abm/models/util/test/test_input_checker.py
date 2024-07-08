@@ -193,4 +193,6 @@ def test_report_errors(households, v_errors, v_warnings, validation_settings, tm
         result = rf.read()
 
     # FIXME need to update artifact or result!
+
+
 #     assert result == artifact, "Log file does not match artifact"
