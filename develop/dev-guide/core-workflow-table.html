@@ -28,7 +28,7 @@
 <link rel="preload" as="font" type="font/woff2" crossorigin href="../_static/vendor/fontawesome/6.5.2/webfonts/fa-brands-400.woff2" />
 <link rel="preload" as="font" type="font/woff2" crossorigin href="../_static/vendor/fontawesome/6.5.2/webfonts/fa-regular-400.woff2" />
 
-    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=fa44fd50" />
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=03e43079" />
     <link rel="stylesheet" type="text/css" href="../_static/mystnb.4510f1fc1dee50b3e5859aac5469c37c29e427902b24a333a5f9fcb2f0b3ac41.css" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
@@ -40,7 +40,7 @@
 <link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=dfe6caa3a7d634c4db9b" />
   <script src="../_static/vendor/fontawesome/6.5.2/js/all.min.js?digest=dfe6caa3a7d634c4db9b"></script>
 
-    <script src="../_static/documentation_options.js?v=5cc8cf78"></script>
+    <script src="../_static/documentation_options.js?v=8178eab3"></script>
     <script src="../_static/doctools.js?v=9a2dae69"></script>
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
@@ -59,7 +59,7 @@
     <link rel="prev" title="step" href="_generated/activitysim.core.workflow.step.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-    <meta name="docbuild:last-update" content="Aug 06, 2024"/>
+    <meta name="docbuild:last-update" content="May 15, 2025"/>
   </head>
   
   
@@ -351,6 +351,7 @@ document.write(`
 <li class="toctree-l1"><a class="reference internal" href="../development.html">Software Development</a></li>
 <li class="toctree-l1"><a class="reference internal" href="component-configs.html">Component Configuration</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="components/index.html">Components</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="components/input_checker.html">Input Checker</a></li>
 <li class="toctree-l2"><a class="reference internal" href="components/initialize.html">Initialize</a></li>
 <li class="toctree-l2"><a class="reference internal" href="components/initialize_los.html">Initialize LOS</a></li>
 <li class="toctree-l2"><a class="reference internal" href="components/initialize_tours.html">Initialize Tours</a></li>
@@ -396,6 +397,7 @@ document.write(`
 <li class="toctree-l1"><a class="reference internal" href="../core.html">Core Components</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../benchmarking.html">Benchmarking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="build-docs.html">Documentation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="changes.html">Change Log</a></li>
 </ul>
 </div>
 </nav></div>
@@ -462,11 +464,11 @@ document.write(`
 <h2>Standard Tables<a class="headerlink" href="#standard-tables" title="Link to this heading">#</a></h2>
 <p>An ActivitySim table definition is written as a Python function with a
 <code class="docutils literal notranslate"><span class="pre">workflow.table</span></code> decorator:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span> <span class="nn">pandas</span> <span class="k">as</span> <span class="nn">pd</span>
-<span class="kn">from</span> <span class="nn">activitysim.core</span> <span class="kn">import</span> <span class="n">workflow</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">pandas</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">pd</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">activitysim.core</span><span class="w"> </span><span class="kn">import</span> <span class="n">workflow</span>
 
 <span class="nd">@workflow</span><span class="o">.</span><span class="n">table</span>
-<span class="k">def</span> <span class="nf">households</span><span class="p">(</span><span class="n">state</span><span class="p">:</span> <span class="n">workflow</span><span class="o">.</span><span class="n">State</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">:</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">households</span><span class="p">(</span><span class="n">state</span><span class="p">:</span> <span class="n">workflow</span><span class="o">.</span><span class="n">State</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">:</span>
     <span class="n">df</span> <span class="o">=</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
     <span class="c1"># do something to set up table here</span>
     <span class="k">return</span> <span class="n">df</span>
@@ -493,11 +495,11 @@ stored in the state’s context as the name of the table.</p>
 <h2>Temporary Tables<a class="headerlink" href="#temporary-tables" title="Link to this heading">#</a></h2>
 <p>In addition to the main <code class="docutils literal notranslate"><span class="pre">workflow.table</span></code> decorator, there is also a similar
 <code class="docutils literal notranslate"><span class="pre">workflow.temp_table</span></code> decorator for temporary tables.</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span> <span class="nn">pandas</span> <span class="k">as</span> <span class="nn">pd</span>
-<span class="kn">from</span> <span class="nn">activitysim.core</span> <span class="kn">import</span> <span class="n">workflow</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">pandas</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">pd</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">activitysim.core</span><span class="w"> </span><span class="kn">import</span> <span class="n">workflow</span>
 
 <span class="nd">@workflow</span><span class="o">.</span><span class="n">temp_table</span>
-<span class="k">def</span> <span class="nf">households_merged</span><span class="p">(</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">households_merged</span><span class="p">(</span>
     <span class="n">state</span><span class="p">:</span> <span class="n">workflow</span><span class="o">.</span><span class="n">State</span><span class="p">,</span>
     <span class="n">households</span><span class="p">:</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">,</span>
     <span class="n">land_use</span><span class="p">:</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">,</span>
@@ -530,10 +532,10 @@ easily from the (now different) predicate values if/when needed for later steps.
 <p>Other arbitrary Python objects can also be generated by functions that are
 handled by the same automatic system as tables, using the <code class="docutils literal notranslate"><span class="pre">workflow.cached_object</span></code>
 decorator.</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">activitysim.core</span> <span class="kn">import</span> <span class="n">workflow</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">activitysim.core</span><span class="w"> </span><span class="kn">import</span> <span class="n">workflow</span>
 
 <span class="nd">@workflow</span><span class="o">.</span><span class="n">cached_object</span>
-<span class="k">def</span> <span class="nf">name_of_object</span><span class="p">(</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">name_of_object</span><span class="p">(</span>
     <span class="n">state</span><span class="p">:</span> <span class="n">workflow</span><span class="o">.</span><span class="n">State</span><span class="p">,</span>
     <span class="n">other_thing</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
 <span class="p">):</span>
@@ -653,7 +655,7 @@ context.</p>
       
         <div class="footer-item"><!-- This will display the version of the docs -->
 <p class="last-updated">
-ActivitySim 1.0.5.dev1843+gd81f5f2c, documentation last updated Aug 06, 2024.<br/>
+ActivitySim 1.0.5.dev1865+gae89183c, documentation last updated May 15, 2025.<br/>
 </p></div>
       
         <div class="footer-item">
